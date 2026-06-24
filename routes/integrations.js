@@ -115,15 +115,15 @@ function ensureIntegrationsTable(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS integrations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      type TEXT NOT NULL,
+      name TEXT,
+      type TEXT,
       category TEXT DEFAULT 'other',
       is_connected INTEGER DEFAULT 0,
       config TEXT DEFAULT '{}',
       webhook_url TEXT,
       connected_at DATETIME,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at DATETIME,
+      updated_at DATETIME
     );
   `);
 
@@ -134,11 +134,16 @@ function ensureIntegrationsTable(db) {
   addColumnIfMissing(db, 'integrations', 'config', "TEXT DEFAULT '{}'");
   addColumnIfMissing(db, 'integrations', 'webhook_url', 'TEXT');
   addColumnIfMissing(db, 'integrations', 'connected_at', 'DATETIME');
-  addColumnIfMissing(db, 'integrations', 'created_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
-  addColumnIfMissing(db, 'integrations', 'updated_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
+
+  // IMPORTANTE:
+  // No usamos DEFAULT CURRENT_TIMESTAMP en ALTER TABLE porque SQLite no lo permite.
+  addColumnIfMissing(db, 'integrations', 'created_at', 'DATETIME');
+  addColumnIfMissing(db, 'integrations', 'updated_at', 'DATETIME');
 
   DEFAULT_INTEGRATIONS.forEach((item) => {
-    const existing = db.prepare('SELECT rowid, * FROM integrations WHERE type = ? ORDER BY rowid ASC LIMIT 1').get(item.type);
+    const existing = db
+      .prepare('SELECT rowid, * FROM integrations WHERE type = ? ORDER BY rowid ASC LIMIT 1')
+      .get(item.type);
 
     if (existing) {
       db.prepare(`
@@ -163,9 +168,10 @@ function ensureIntegrationsTable(db) {
           category,
           config,
           is_connected,
+          created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
       `).run(
         item.name,
         item.type,
@@ -175,7 +181,6 @@ function ensureIntegrationsTable(db) {
     }
   });
 
-  // Elimina duplicados dejando solo el primer registro de cada tipo.
   try {
     db.prepare(`
       DELETE FROM integrations
