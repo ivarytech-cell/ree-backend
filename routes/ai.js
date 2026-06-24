@@ -22,7 +22,6 @@ function getAnthropicKey() {
 function getClient() {
   const apiKey = getAnthropicKey();
   if (!apiKey) throw new Error('No hay clave de Claude AI configurada. Ve a Configuración → API y guarda tu clave.');
-  return new Anthropic({ apiKey });
 }
 
 // POST /api/ai/generate-product
