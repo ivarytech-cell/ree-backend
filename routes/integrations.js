@@ -86,6 +86,49 @@ const DEFAULT_INTEGRATIONS = [
   }
 ];
 
+const ALIASES = {
+  claude: 'claude_ai',
+  anthropic: 'claude_ai',
+  anthropic_ai: 'claude_ai',
+  claudeai: 'claude_ai',
+
+  chatgpt: 'openai',
+  open_ai: 'openai',
+  openai_chat: 'openai',
+  gpt: 'openai',
+
+  image_openai: 'openai_images',
+  images_openai: 'openai_images',
+  image_ai: 'openai_images',
+  imagenes_openai: 'openai_images',
+
+  claude_prompt: 'claude_design',
+  claude_visual: 'claude_design',
+  claude_image_prompt: 'claude_design',
+
+  woo: 'woocommerce',
+  wc: 'woocommerce',
+  woo_api: 'woocommerce',
+  woocommerce_rest: 'woocommerce',
+
+  wp: 'wordpress',
+
+  instagram: 'instagram_dm',
+  instagramdm: 'instagram_dm',
+
+  fb_messenger: 'messenger',
+  facebook: 'messenger',
+
+  meta: 'meta_ads',
+  google: 'google_ads'
+};
+
+function normalizeType(value) {
+  const clean = String(value || '').trim().toLowerCase();
+
+  return ALIASES[clean] || clean;
+}
+
 function ensureSettingsTable(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
@@ -108,93 +151,6 @@ function addColumnIfMissing(db, table, column, definition) {
 
   if (!columns.includes(column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-}
-
-function ensureIntegrationsTable(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS integrations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT,
-      type TEXT,
-      category TEXT DEFAULT 'other',
-      is_connected INTEGER DEFAULT 0,
-      config TEXT DEFAULT '{}',
-      webhook_url TEXT,
-      connected_at DATETIME,
-      created_at DATETIME,
-      updated_at DATETIME
-    );
-  `);
-
-  addColumnIfMissing(db, 'integrations', 'name', 'TEXT');
-  addColumnIfMissing(db, 'integrations', 'type', 'TEXT');
-  addColumnIfMissing(db, 'integrations', 'category', "TEXT DEFAULT 'other'");
-  addColumnIfMissing(db, 'integrations', 'is_connected', 'INTEGER DEFAULT 0');
-  addColumnIfMissing(db, 'integrations', 'config', "TEXT DEFAULT '{}'");
-  addColumnIfMissing(db, 'integrations', 'webhook_url', 'TEXT');
-  addColumnIfMissing(db, 'integrations', 'connected_at', 'DATETIME');
-
-  // IMPORTANTE:
-  // No usamos DEFAULT CURRENT_TIMESTAMP en ALTER TABLE porque SQLite no lo permite.
-  addColumnIfMissing(db, 'integrations', 'created_at', 'DATETIME');
-  addColumnIfMissing(db, 'integrations', 'updated_at', 'DATETIME');
-
-  DEFAULT_INTEGRATIONS.forEach((item) => {
-    const existing = db
-      .prepare('SELECT rowid, * FROM integrations WHERE type = ? ORDER BY rowid ASC LIMIT 1')
-      .get(item.type);
-
-    if (existing) {
-      db.prepare(`
-        UPDATE integrations
-        SET
-          name = ?,
-          category = ?,
-          config = CASE WHEN config IS NULL OR config = '' THEN ? ELSE config END,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE rowid = ?
-      `).run(
-        item.name,
-        item.category,
-        JSON.stringify(item.config || {}),
-        existing.rowid
-      );
-    } else {
-      db.prepare(`
-        INSERT INTO integrations (
-          name,
-          type,
-          category,
-          config,
-          is_connected,
-          created_at,
-          updated_at
-        )
-        VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      `).run(
-        item.name,
-        item.type,
-        item.category,
-        JSON.stringify(item.config || {})
-      );
-    }
-  });
-
-  try {
-    db.prepare(`
-      DELETE FROM integrations
-      WHERE rowid NOT IN (
-        SELECT MIN(rowid)
-        FROM integrations
-        WHERE type IS NOT NULL AND type != ''
-        GROUP BY type
-      )
-      AND type IS NOT NULL
-      AND type != ''
-    `).run();
-  } catch (error) {
-    console.error('No se pudieron limpiar duplicados de integraciones:', error.message);
   }
 }
 
@@ -222,6 +178,20 @@ function normalizeUrl(url) {
   return clean.replace(/\/+$/, '');
 }
 
+function extractAnthropicKey(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/sk-ant-[A-Za-z0-9_\-]+/);
+
+  return match ? match[0] : text;
+}
+
+function extractOpenAIKey(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/sk-[A-Za-z0-9_\-]+/);
+
+  return match ? match[0] : text;
+}
+
 function getSetting(db, key, fallback = '') {
   try {
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
@@ -233,6 +203,7 @@ function getSetting(db, key, fallback = '') {
 
 function saveSetting(db, key, value) {
   ensureSettingsTable(db);
+
   db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value || '');
 }
 
@@ -307,6 +278,7 @@ function getWooConfigFromSettingsAndConfig(db, config = {}) {
 
 function saveWooConfigToSettings(db, config = {}) {
   const current = getWooConfigFromSettingsAndConfig(db, {});
+
   const finalConfig = getWooConfigFromSettingsAndConfig(db, {
     ...current,
     ...config
@@ -382,19 +354,33 @@ async function testWooCommerce(config) {
   }
 }
 
+function readApiKeyFromConfig(config = {}, possibleKeys = []) {
+  for (const key of possibleKeys) {
+    if (config[key]) return config[key];
+  }
+
+  return '';
+}
+
 async function testClaude(config = {}) {
   const db = getDb();
   const settings = getSettings(db);
 
-  const apiKey =
-    config.api_key ||
-    config.anthropic_key ||
-    settings.anthropic_key ||
-    process.env.ANTHROPIC_API_KEY ||
-    '';
+  let apiKey = readApiKeyFromConfig(config, [
+    'api_key',
+    'anthropic_key',
+    'claude_key',
+    'key',
+    'token',
+    'value',
+    'secret'
+  ]);
 
-  if (!apiKey) {
-    throw new Error('Falta el API Key de Claude / Anthropic.');
+  apiKey = apiKey || settings.anthropic_key || process.env.ANTHROPIC_API_KEY || '';
+  apiKey = extractAnthropicKey(apiKey);
+
+  if (!apiKey || !apiKey.startsWith('sk-ant-')) {
+    throw new Error('Falta una API Key válida de Claude / Anthropic. Debe empezar con sk-ant-.');
   }
 
   const client = new Anthropic({
@@ -428,15 +414,21 @@ async function testOpenAI(config = {}) {
   const db = getDb();
   const settings = getSettings(db);
 
-  const apiKey =
-    config.api_key ||
-    config.openai_key ||
-    settings.openai_key ||
-    process.env.OPENAI_API_KEY ||
-    '';
+  let apiKey = readApiKeyFromConfig(config, [
+    'api_key',
+    'openai_key',
+    'chatgpt_key',
+    'key',
+    'token',
+    'value',
+    'secret'
+  ]);
 
-  if (!apiKey) {
-    throw new Error('Falta el API Key de OpenAI.');
+  apiKey = apiKey || settings.openai_key || process.env.OPENAI_API_KEY || '';
+  apiKey = extractOpenAIKey(apiKey);
+
+  if (!apiKey || !apiKey.startsWith('sk-')) {
+    throw new Error('Falta una API Key válida de OpenAI. Debe empezar con sk-.');
   }
 
   await axios.get('https://api.openai.com/v1/models', {
@@ -465,7 +457,11 @@ function cleanIntegrationForResponse(row) {
     'wc_secret',
     'woo_secret',
     'openai_key',
-    'anthropic_key'
+    'anthropic_key',
+    'claude_key',
+    'chatgpt_key',
+    'key',
+    'token'
   ].forEach((key) => {
     if (safeConfig[key]) {
       safeConfig[key] = SECRET_MASK;
@@ -474,15 +470,165 @@ function cleanIntegrationForResponse(row) {
 
   return {
     ...row,
+    type: normalizeType(row.type),
     is_connected: Number(row.is_connected || 0) === 1,
     config: safeConfig
   };
 }
 
+function migrateLegacyIntegrations(db) {
+  const rows = db.prepare('SELECT rowid, * FROM integrations').all();
+
+  rows.forEach((row) => {
+    const canonical = normalizeType(row.type);
+
+    if (canonical && canonical !== row.type) {
+      const existingCanonical = db
+        .prepare('SELECT rowid, * FROM integrations WHERE type = ? ORDER BY rowid ASC LIMIT 1')
+        .get(canonical);
+
+      if (existingCanonical) {
+        const oldConfig = parseConfig(existingCanonical.config);
+        const legacyConfig = parseConfig(row.config);
+
+        const mergedConfig = {
+          ...oldConfig,
+          ...legacyConfig
+        };
+
+        const connected = Number(existingCanonical.is_connected || 0) === 1 || Number(row.is_connected || 0) === 1 ? 1 : 0;
+
+        db.prepare(`
+          UPDATE integrations
+          SET
+            config = ?,
+            is_connected = ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE rowid = ?
+        `).run(
+          JSON.stringify(mergedConfig),
+          connected,
+          existingCanonical.rowid
+        );
+
+        db.prepare('DELETE FROM integrations WHERE rowid = ?').run(row.rowid);
+      } else {
+        db.prepare(`
+          UPDATE integrations
+          SET
+            type = ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE rowid = ?
+        `).run(canonical, row.rowid);
+      }
+    }
+  });
+
+  try {
+    db.prepare(`
+      DELETE FROM integrations
+      WHERE rowid NOT IN (
+        SELECT MIN(rowid)
+        FROM integrations
+        WHERE type IS NOT NULL AND type != ''
+        GROUP BY type
+      )
+      AND type IS NOT NULL
+      AND type != ''
+    `).run();
+  } catch (error) {
+    console.error('No se pudieron limpiar duplicados de integraciones:', error.message);
+  }
+}
+
+function ensureIntegrationsTable(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS integrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT,
+      type TEXT,
+      category TEXT DEFAULT 'other',
+      is_connected INTEGER DEFAULT 0,
+      config TEXT DEFAULT '{}',
+      webhook_url TEXT,
+      connected_at DATETIME,
+      created_at DATETIME,
+      updated_at DATETIME
+    );
+  `);
+
+  addColumnIfMissing(db, 'integrations', 'name', 'TEXT');
+  addColumnIfMissing(db, 'integrations', 'type', 'TEXT');
+  addColumnIfMissing(db, 'integrations', 'category', "TEXT DEFAULT 'other'");
+  addColumnIfMissing(db, 'integrations', 'is_connected', 'INTEGER DEFAULT 0');
+  addColumnIfMissing(db, 'integrations', 'config', "TEXT DEFAULT '{}'");
+  addColumnIfMissing(db, 'integrations', 'webhook_url', 'TEXT');
+  addColumnIfMissing(db, 'integrations', 'connected_at', 'DATETIME');
+
+  // SQLite no permite agregar columnas con DEFAULT CURRENT_TIMESTAMP usando ALTER TABLE.
+  addColumnIfMissing(db, 'integrations', 'created_at', 'DATETIME');
+  addColumnIfMissing(db, 'integrations', 'updated_at', 'DATETIME');
+
+  migrateLegacyIntegrations(db);
+
+  DEFAULT_INTEGRATIONS.forEach((item) => {
+    const existing = db
+      .prepare('SELECT rowid, * FROM integrations WHERE type = ? ORDER BY rowid ASC LIMIT 1')
+      .get(item.type);
+
+    if (existing) {
+      db.prepare(`
+        UPDATE integrations
+        SET
+          name = ?,
+          category = ?,
+          config = CASE WHEN config IS NULL OR config = '' THEN ? ELSE config END,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE rowid = ?
+      `).run(
+        item.name,
+        item.category,
+        JSON.stringify(item.config || {}),
+        existing.rowid
+      );
+    } else {
+      db.prepare(`
+        INSERT INTO integrations (
+          name,
+          type,
+          category,
+          config,
+          is_connected,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).run(
+        item.name,
+        item.type,
+        item.category,
+        JSON.stringify(item.config || {})
+      );
+    }
+  });
+
+  migrateLegacyIntegrations(db);
+}
+
 function findIntegration(db, idOrType) {
+  const clean = String(idOrType || '').trim();
+  const canonical = normalizeType(clean);
+
   return db
-    .prepare('SELECT rowid, * FROM integrations WHERE CAST(id AS TEXT) = ? OR type = ? LIMIT 1')
-    .get(String(idOrType), String(idOrType));
+    .prepare(`
+      SELECT rowid, *
+      FROM integrations
+      WHERE CAST(id AS TEXT) = ?
+         OR type = ?
+         OR type = ?
+      LIMIT 1
+    `)
+    .get(clean, clean, canonical);
 }
 
 function updateIntegration(db, idOrType, data = {}) {
@@ -524,6 +670,34 @@ function updateIntegration(db, idOrType, data = {}) {
   return db.prepare('SELECT rowid, * FROM integrations WHERE rowid = ?').get(existing.rowid);
 }
 
+function getDefaultManualMessage(type) {
+  if (type === 'whatsapp') {
+    return 'WhatsApp Business requiere configurar Meta App, token permanente, Phone Number ID y webhook.';
+  }
+
+  if (type === 'messenger') {
+    return 'Facebook Messenger requiere Page Access Token, App Secret y webhook.';
+  }
+
+  if (type === 'instagram_dm') {
+    return 'Instagram DM requiere cuenta profesional conectada a Meta y permisos de mensajería.';
+  }
+
+  if (type === 'meta_ads') {
+    return 'Meta Ads requiere Access Token, Ad Account ID y Business Manager.';
+  }
+
+  if (type === 'google_ads') {
+    return 'Google Ads requiere OAuth, Developer Token y Customer ID.';
+  }
+
+  if (type === 'wordpress') {
+    return 'WordPress puede conectarse con credenciales de aplicación o mediante la conexión WooCommerce existente.';
+  }
+
+  return 'La integración está disponible para configurar manualmente.';
+}
+
 // GET /api/integrations
 router.get('/', authMiddleware, (req, res) => {
   try {
@@ -540,6 +714,7 @@ router.get('/', authMiddleware, (req, res) => {
     res.json(rows);
   } catch (error) {
     console.error('[integrations] GET error:', error);
+
     res.status(500).json({
       error: 'Error cargando integraciones: ' + error.message
     });
@@ -603,13 +778,23 @@ router.put('/:id', authMiddleware, requireRole('admin', 'superadmin'), (req, res
     ensureSettingsTable(db);
     ensureIntegrationsTable(db);
 
-    const updated = updateIntegration(db, req.params.id, {
+    const existing = findIntegration(db, req.params.id);
+
+    if (!existing) {
+      return res.status(404).json({
+        error: 'Integración no encontrada.'
+      });
+    }
+
+    const updated = updateIntegration(db, existing.rowid, {
       config: req.body?.config || {},
       is_connected: req.body?.is_connected,
       webhook_url: req.body?.webhook_url
     });
 
-    if (updated.type === 'woocommerce') {
+    const type = normalizeType(updated.type);
+
+    if (type === 'woocommerce') {
       saveWooConfigToSettings(db, req.body?.config || {});
     }
 
@@ -637,9 +822,12 @@ router.post('/:id/connect', authMiddleware, requireRole('admin', 'superadmin'), 
 
     if (!existing) {
       return res.status(404).json({
+        success: false,
         error: 'Integración no encontrada.'
       });
     }
+
+    const type = normalizeType(existing.type);
 
     const config = {
       ...parseConfig(existing.config),
@@ -648,25 +836,27 @@ router.post('/:id/connect', authMiddleware, requireRole('admin', 'superadmin'), 
 
     let result = {
       success: true,
-      message: 'Integración conectada correctamente.'
+      message: getDefaultManualMessage(type)
     };
 
-    if (existing.type === 'woocommerce') {
+    let shouldMarkConnected = true;
+
+    if (type === 'woocommerce') {
       const wooConfig = saveWooConfigToSettings(db, config);
       result = await testWooCommerce(wooConfig);
-    }
-
-    if (existing.type === 'claude_ai' || existing.type === 'claude_design') {
+    } else if (type === 'claude_ai' || type === 'claude_design') {
       result = await testClaude(config);
-    }
-
-    if (existing.type === 'openai' || existing.type === 'openai_images') {
+    } else if (type === 'openai' || type === 'openai_images') {
       result = await testOpenAI(config);
+    } else {
+      // Para integraciones como WhatsApp, Messenger, Meta Ads y Google Ads,
+      // las dejamos listas para configuración manual, no conectadas automáticamente.
+      shouldMarkConnected = !!req.body?.force_connected;
     }
 
     const updated = updateIntegration(db, existing.rowid, {
       config,
-      is_connected: true,
+      is_connected: shouldMarkConnected,
       webhook_url: req.body?.webhook_url
     });
 
@@ -697,9 +887,12 @@ router.post('/:id/test', authMiddleware, requireRole('admin', 'superadmin'), asy
 
     if (!existing) {
       return res.status(404).json({
+        success: false,
         error: 'Integración no encontrada.'
       });
     }
+
+    const type = normalizeType(existing.type);
 
     const config = {
       ...parseConfig(existing.config),
@@ -708,21 +901,25 @@ router.post('/:id/test', authMiddleware, requireRole('admin', 'superadmin'), asy
 
     let result = {
       success: true,
-      message: 'La integración está disponible para configurar.'
+      message: getDefaultManualMessage(type)
     };
 
-    if (existing.type === 'woocommerce') {
+    let shouldMarkConnected = true;
+
+    if (type === 'woocommerce') {
       const wooConfig = saveWooConfigToSettings(db, config);
       result = await testWooCommerce(wooConfig);
-    } else if (existing.type === 'claude_ai' || existing.type === 'claude_design') {
+    } else if (type === 'claude_ai' || type === 'claude_design') {
       result = await testClaude(config);
-    } else if (existing.type === 'openai' || existing.type === 'openai_images') {
+    } else if (type === 'openai' || type === 'openai_images') {
       result = await testOpenAI(config);
+    } else {
+      shouldMarkConnected = !!req.body?.force_connected;
     }
 
     const updated = updateIntegration(db, existing.rowid, {
       config,
-      is_connected: true
+      is_connected: shouldMarkConnected
     });
 
     res.json({
