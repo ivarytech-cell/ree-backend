@@ -1,4 +1,3 @@
-// middleware/upload.js
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -30,8 +29,21 @@ const datasheetStorage = multer.diskStorage({
   filename: (req, file, cb) => cb(null, `ds_${Date.now()}${path.extname(file.originalname)}`)
 });
 
-const uploadImages = multer({ storage: imageStorage, limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (req, file, cb) => cb(null, /image\/(jpeg|png|gif|webp)/.test(file.mimetype)) });
-const uploadPdf = multer({ storage: pdfStorage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: (req, file, cb) => cb(null, file.mimetype === 'application/pdf') });
-const uploadDatasheet = multer({ storage: datasheetStorage, limits: { fileSize: 20 * 1024 * 1024 } });
+const uploadImages = multer({
+  storage: imageStorage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, /image\/(jpeg|png|gif|webp)/.test(file.mimetype))
+});
+
+const uploadPdf = multer({
+  storage: pdfStorage,
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, file.mimetype === 'application/pdf')
+});
+
+const uploadDatasheet = multer({
+  storage: datasheetStorage,
+  limits: { fileSize: 20 * 1024 * 1024 }
+});
 
 module.exports = { uploadImages, uploadPdf, uploadDatasheet };
