@@ -1,411 +1,1659 @@
-const express = require('express')
-const router = express.Router()
-const https = require('https')
-const http = require('http')
-const { authMiddleware, requireRole } = require('../middleware/auth')
-const { getDb } = require('../database')
+const express = require('express');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { getDb } = require('../db/database');
+const { authMiddleware, requireRole } = require('../middleware/auth');
 
-// Ensure settings table exists
-function ensureSettingsTable(db) {
-  db.prepare(`
+const router = express.Router();
+
+const SECRET_MASK = '••••••••';
+
+const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+  : (process.env.BACKEND_URL || 'https://ree-backend-production.up.railway.app');
+
+function getColumns(db, table) {
+  try {
+    return db.prepare(`PRAGMA table_info(${table})`).all().map((col) => col.name);
+  } catch (error) {
+    return [];
+  }
+}
+
+function addColumnIfMissing(db, table, column, definition) {
+  const columns = getColumns(db, table);
+
+  if (!columns.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+function ensureSchema(db) {
+  db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS categories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      key TEXT UNIQUE NOT NULL,
-      value TEXT,
+      name TEXT NOT NULL,
+      slug TEXT,
+      parent_id INTEGER,
+      wp_id INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS brands (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      slug TEXT,
+      logo TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS products (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      short_description TEXT,
+      description TEXT,
+      brand_id INTEGER,
+      category_id INTEGER,
+      model TEXT,
+      type TEXT DEFAULT 'simple',
+      sku TEXT,
+      price REAL,
+      sale_price REAL,
+      stock_quantity INTEGER DEFAULT 0,
+      stock_status TEXT DEFAULT 'instock',
+      youtube_url TEXT,
+      pdf_filename TEXT,
+      seo_keyword TEXT,
+      seo_title TEXT,
+      seo_description TEXT,
+      status TEXT DEFAULT 'draft',
+      wp_product_id INTEGER,
+      created_by INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run()
+    );
+
+    CREATE TABLE IF NOT EXISTS product_images (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL,
+      filename TEXT NOT NULL,
+      is_main INTEGER DEFAULT 0,
+      sort_order INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS product_attributes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      value TEXT NOT NULL
+    );
+  `);
+
+  addColumnIfMissing(db, 'categories', 'slug', 'TEXT');
+  addColumnIfMissing(db, 'categories', 'parent_id', 'INTEGER');
+  addColumnIfMissing(db, 'categories', 'wp_id', 'INTEGER');
+  addColumnIfMissing(db, 'categories', 'woo_id', 'INTEGER');
+
+  addColumnIfMissing(db, 'brands', 'slug', 'TEXT');
+  addColumnIfMissing(db, 'brands', 'logo', 'TEXT');
+
+  addColumnIfMissing(db, 'products', 'short_description', 'TEXT');
+  addColumnIfMissing(db, 'products', 'description', 'TEXT');
+  addColumnIfMissing(db, 'products', 'brand_id', 'INTEGER');
+  addColumnIfMissing(db, 'products', 'category_id', 'INTEGER');
+  addColumnIfMissing(db, 'products', 'model', 'TEXT');
+  addColumnIfMissing(db, 'products', 'type', "TEXT DEFAULT 'simple'");
+  addColumnIfMissing(db, 'products', 'sku', 'TEXT');
+  addColumnIfMissing(db, 'products', 'price', 'REAL');
+  addColumnIfMissing(db, 'products', 'sale_price', 'REAL');
+  addColumnIfMissing(db, 'products', 'stock_quantity', 'INTEGER DEFAULT 0');
+  addColumnIfMissing(db, 'products', 'stock_status', "TEXT DEFAULT 'instock'");
+  addColumnIfMissing(db, 'products', 'youtube_url', 'TEXT');
+  addColumnIfMissing(db, 'products', 'pdf_filename', 'TEXT');
+  addColumnIfMissing(db, 'products', 'seo_keyword', 'TEXT');
+  addColumnIfMissing(db, 'products', 'seo_title', 'TEXT');
+  addColumnIfMissing(db, 'products', 'seo_description', 'TEXT');
+  addColumnIfMissing(db, 'products', 'status', "TEXT DEFAULT 'draft'");
+  addColumnIfMissing(db, 'products', 'wp_product_id', 'INTEGER');
+  addColumnIfMissing(db, 'products', 'woo_id', 'INTEGER');
+  addColumnIfMissing(db, 'products', 'created_by', 'INTEGER');
+  addColumnIfMissing(db, 'products', 'created_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
+  addColumnIfMissing(db, 'products', 'updated_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
 }
 
-function getWooConfig(db) {
-  ensureSettingsTable(db)
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'woocommerce_config'").get()
-  if (!row) return null
-  try { return JSON.parse(row.value) } catch { return null }
+function normalizeUrl(url) {
+  if (!url) return '';
+
+  let clean = String(url).trim();
+
+  if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
+    clean = 'https://' + clean;
+  }
+
+  return clean.replace(/\/+$/, '');
 }
 
-// Simple HTTP request helper (compatible with any Node version)
-function httpRequest(url, options = {}) {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url)
-    const lib = parsedUrl.protocol === 'https:' ? https : http
-    const req = lib.request({
-      hostname: parsedUrl.hostname,
-      path: parsedUrl.pathname + parsedUrl.search,
-      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
-      method: options.method || 'GET',
-      headers: options.headers || {},
-    }, (res) => {
-      let data = ''
-      res.on('data', chunk => data += chunk)
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try { resolve(JSON.parse(data)) } catch { resolve(data) }
-        } else {
-          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`))
-        }
-      })
+function slugify(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'sin-slug';
+}
+
+function stripHtml(value) {
+  return String(value || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function getSetting(db, key, fallback = '') {
+  try {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    return row?.value || fallback || '';
+  } catch (error) {
+    return fallback || '';
+  }
+}
+
+function saveSetting(db, key, value) {
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value || '');
+}
+
+function getWooConfig(overrides = {}) {
+  const db = getDb();
+
+  ensureSchema(db);
+
+  let legacy = {};
+
+  try {
+    const raw = getSetting(db, 'woocommerce_config', '');
+    legacy = raw ? JSON.parse(raw) : {};
+  } catch (error) {
+    legacy = {};
+  }
+
+  const url = normalizeUrl(
+    overrides.wc_url ||
+    overrides.woo_url ||
+    overrides.url ||
+    getSetting(db, 'wc_url', '') ||
+    legacy.wc_url ||
+    legacy.woo_url ||
+    process.env.WC_URL ||
+    ''
+  );
+
+  const key = String(
+    overrides.wc_key ||
+    overrides.woo_key ||
+    overrides.key ||
+    getSetting(db, 'wc_key', '') ||
+    legacy.wc_key ||
+    legacy.woo_key ||
+    process.env.WC_KEY ||
+    ''
+  ).trim();
+
+  let secret =
+    overrides.wc_secret ||
+    overrides.woo_secret ||
+    overrides.secret ||
+    getSetting(db, 'wc_secret', '') ||
+    legacy.wc_secret ||
+    legacy.woo_secret ||
+    process.env.WC_SECRET ||
+    '';
+
+  if (secret === SECRET_MASK || secret === '***') {
+    secret =
+      getSetting(db, 'wc_secret', '') ||
+      legacy.wc_secret ||
+      legacy.woo_secret ||
+      process.env.WC_SECRET ||
+      '';
+  }
+
+  secret = String(secret || '').trim();
+
+  return {
+    url,
+    key,
+    secret
+  };
+}
+
+function saveWooConfig(body = {}) {
+  const db = getDb();
+
+  ensureSchema(db);
+
+  const current = getWooConfig();
+
+  const url = normalizeUrl(body.wc_url || body.woo_url || body.url || current.url);
+  const key = String(body.wc_key || body.woo_key || body.key || current.key || '').trim();
+
+  let secret = body.wc_secret || body.woo_secret || body.secret || current.secret || '';
+
+  if (secret === SECRET_MASK || secret === '***') {
+    secret = current.secret;
+  }
+
+  secret = String(secret || '').trim();
+
+  saveSetting(db, 'wc_url', url);
+  saveSetting(db, 'wc_key', key);
+  saveSetting(db, 'wc_secret', secret);
+
+  saveSetting(
+    db,
+    'woocommerce_config',
+    JSON.stringify({
+      wc_url: url,
+      wc_key: key,
+      wc_secret: secret,
+      woo_url: url,
+      woo_key: key,
+      woo_secret: secret
     })
-    req.on('error', reject)
-    if (options.body) req.write(options.body)
-    req.end()
-  })
+  );
+
+  return {
+    url,
+    key,
+    secret
+  };
+}
+
+function validateWooConfig(config) {
+  if (!config.url) return 'Falta la URL del sitio WooCommerce.';
+  if (!config.key) return 'Falta el Consumer Key de WooCommerce.';
+  if (!config.secret) return 'Falta el Consumer Secret de WooCommerce.';
+  if (!config.key.startsWith('ck_')) return 'El Consumer Key debe empezar con ck_.';
+  if (!config.secret.startsWith('cs_')) return 'El Consumer Secret debe empezar con cs_.';
+
+  return null;
+}
+
+async function wooRequest(config, method, endpoint, options = {}) {
+  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  const baseURL = `${config.url}/wp-json/wc/v3`;
+
+  const requestOptions = {
+    method,
+    baseURL,
+    url: cleanEndpoint,
+    timeout: options.timeout || 45000,
+    params: options.params || {},
+    data: options.data,
+    headers: options.headers || {},
+    auth: {
+      username: config.key,
+      password: config.secret
+    }
+  };
+
+  try {
+    return await axios(requestOptions);
+  } catch (firstError) {
+    const status = firstError.response?.status;
+    const message = String(firstError.response?.data?.message || firstError.message || '').toLowerCase();
+
+    const shouldTryQueryAuth =
+      status === 401 ||
+      status === 403 ||
+      message.includes('consumer') ||
+      message.includes('signature') ||
+      message.includes('authentication');
+
+    if (!shouldTryQueryAuth) {
+      throw firstError;
+    }
+
+    return await axios({
+      ...requestOptions,
+      auth: undefined,
+      params: {
+        ...(options.params || {}),
+        consumer_key: config.key,
+        consumer_secret: config.secret
+      }
+    });
+  }
+}
+
+function cleanWooError(err) {
+  const status = err.response?.status;
+  const data = err.response?.data;
+  const message = data?.message || err.message || 'Error desconocido';
+
+  if (status === 401) {
+    return 'Error 401: WooCommerce rechazó las credenciales. Revisa Consumer Key y Consumer Secret con permiso Read/Write.';
+  }
+
+  if (status === 403) {
+    return 'Error 403: el servidor bloqueó la autenticación o el usuario no tiene permisos suficientes.';
+  }
+
+  if (status === 404) {
+    return 'Error 404: no se encontró WooCommerce. Revisa que WooCommerce esté activo y que la URL sea correcta.';
+  }
+
+  return `Error WooCommerce: ${message}`;
+}
+
+async function getAllWooProducts(config, status = 'any') {
+  const all = [];
+  let page = 1;
+
+  while (true) {
+    const { data } = await wooRequest(config, 'GET', '/products', {
+      params: {
+        per_page: 100,
+        page,
+        status,
+        orderby: 'date',
+        order: 'desc'
+      }
+    });
+
+    if (!Array.isArray(data) || data.length === 0) break;
+
+    all.push(...data);
+
+    if (data.length < 100) break;
+
+    page += 1;
+  }
+
+  return all;
+}
+
+async function getWooProduct(config, id) {
+  const { data } = await wooRequest(config, 'GET', `/products/${id}`);
+  return data;
+}
+
+function getLocalProducts(db) {
+  ensureSchema(db);
+
+  return db.prepare(`
+    SELECT
+      p.*,
+      b.name AS brand_name,
+      c.name AS category_name,
+      (
+        SELECT filename
+        FROM product_images
+        WHERE product_id = p.id AND is_main = 1
+        LIMIT 1
+      ) AS main_image
+    FROM products p
+    LEFT JOIN brands b ON p.brand_id = b.id
+    LEFT JOIN categories c ON p.category_id = c.id
+    ORDER BY p.updated_at DESC
+  `).all();
+}
+
+function findLocalMatch(wooProduct, localProducts) {
+  const byWp = localProducts.find((p) => {
+    return Number(p.wp_product_id || p.woo_id || 0) === Number(wooProduct.id);
+  });
+
+  if (byWp) {
+    return {
+      product: byWp,
+      match_type: 'wp_product_id'
+    };
+  }
+
+  if (wooProduct.sku) {
+    const bySku = localProducts.find((p) => {
+      return String(p.sku || '').trim().toLowerCase() === String(wooProduct.sku).trim().toLowerCase();
+    });
+
+    if (bySku) {
+      return {
+        product: bySku,
+        match_type: 'sku'
+      };
+    }
+  }
+
+  const byName = localProducts.find((p) => {
+    return String(p.name || '').trim().toLowerCase() === String(wooProduct.name || '').trim().toLowerCase();
+  });
+
+  if (byName) {
+    return {
+      product: byName,
+      match_type: 'name'
+    };
+  }
+
+  return {
+    product: null,
+    match_type: ''
+  };
+}
+
+function wooProductToRow(wooProduct, localMatch) {
+  const local = localMatch.product;
+  const wooImage = Array.isArray(wooProduct.images) && wooProduct.images[0] ? wooProduct.images[0].src : '';
+
+  const inSystem = !!local;
+  const linked = !!local && Number(local.wp_product_id || local.woo_id || 0) === Number(wooProduct.id);
+  const onlyWooCommerce = !inSystem;
+
+  const wooPrice = String(wooProduct.regular_price || wooProduct.price || '');
+  const localPrice = String(local?.price || '');
+
+  const needsUpdate = !!local && (
+    String(local.name || '') !== String(wooProduct.name || '') ||
+    localPrice !== wooPrice ||
+    String(local.sale_price || '') !== String(wooProduct.sale_price || '') ||
+    String(local.stock_status || '') !== String(wooProduct.stock_status || '')
+  );
+
+  return {
+    source: 'woocommerce',
+    woo_id: wooProduct.id,
+    local_id: local?.id || null,
+    match_type: localMatch.match_type || '',
+    in_system: inSystem,
+    linked,
+    only_woocommerce: onlyWooCommerce,
+    only_system: false,
+    needs_update: needsUpdate,
+    suggested_action: onlyWooCommerce ? 'import' : needsUpdate ? 'update' : 'ok',
+    name: wooProduct.name || '',
+    sku: wooProduct.sku || '',
+    type: wooProduct.type || 'simple',
+    status: wooProduct.status || '',
+    price: wooProduct.regular_price || wooProduct.price || '',
+    sale_price: wooProduct.sale_price || '',
+    stock_quantity: wooProduct.stock_quantity || 0,
+    stock_status: wooProduct.stock_status || '',
+    permalink: wooProduct.permalink || '',
+    image: wooImage,
+    local_status: local?.status || '',
+    local_name: local?.name || '',
+    local_main_image: local?.main_image ? `${BACKEND_URL}/uploads/images/${local.main_image}` : ''
+  };
+}
+
+function filterRows(rows, filter, search) {
+  let filtered = rows;
+
+  if (filter === 'in_system') filtered = filtered.filter((r) => r.in_system);
+  if (filter === 'linked') filtered = filtered.filter((r) => r.linked);
+  if (filter === 'only_woocommerce') filtered = filtered.filter((r) => r.only_woocommerce);
+  if (filter === 'not_in_system') filtered = filtered.filter((r) => r.only_woocommerce);
+  if (filter === 'missing') filtered = filtered.filter((r) => r.only_woocommerce);
+  if (filter === 'needs_update') filtered = filtered.filter((r) => r.needs_update);
+  if (filter === 'only_system') filtered = filtered.filter((r) => r.only_system);
+
+  const q = String(search || '').trim().toLowerCase();
+
+  if (q) {
+    filtered = filtered.filter((r) => {
+      return [r.name, r.sku, r.local_name].some((v) => String(v || '').toLowerCase().includes(q));
+    });
+  }
+
+  return filtered;
+}
+
+function getOrCreateCategory(db, wooCategory) {
+  if (!wooCategory) return null;
+
+  const wpId = Number(wooCategory.id || 0);
+  let row = null;
+
+  if (wpId) {
+    row = db.prepare('SELECT id FROM categories WHERE wp_id = ? OR woo_id = ?').get(wpId, wpId);
+  }
+
+  if (!row) {
+    row = db.prepare('SELECT id FROM categories WHERE LOWER(name) = LOWER(?)').get(wooCategory.name || '');
+  }
+
+  if (row) {
+    if (wpId) {
+      db.prepare('UPDATE categories SET wp_id = ?, woo_id = ?, slug = ? WHERE id = ?')
+        .run(wpId, wpId, wooCategory.slug || slugify(wooCategory.name), row.id);
+    }
+
+    return row.id;
+  }
+
+  const result = db.prepare(`
+    INSERT INTO categories (
+      name,
+      slug,
+      wp_id,
+      woo_id
+    )
+    VALUES (?, ?, ?, ?)
+  `).run(
+    wooCategory.name || 'Sin categoría',
+    wooCategory.slug || slugify(wooCategory.name),
+    wpId || null,
+    wpId || null
+  );
+
+  return result.lastInsertRowid;
+}
+
+function getOrCreateBrand(db, wooProduct) {
+  const attrs = Array.isArray(wooProduct.attributes) ? wooProduct.attributes : [];
+
+  const brandAttr = attrs.find((attr) => {
+    const name = String(attr.name || '').toLowerCase();
+    const slug = String(attr.slug || '').toLowerCase();
+
+    return name.includes('marca') || name.includes('brand') || slug.includes('marca') || slug.includes('brand');
+  });
+
+  const brandName = brandAttr && Array.isArray(brandAttr.options) ? brandAttr.options[0] : '';
+
+  if (!brandName) return null;
+
+  let row = db.prepare('SELECT id FROM brands WHERE LOWER(name) = LOWER(?)').get(brandName);
+
+  if (row) return row.id;
+
+  const result = db.prepare('INSERT INTO brands (name, slug) VALUES (?, ?)')
+    .run(brandName, slugify(brandName));
+
+  return result.lastInsertRowid;
+}
+
+async function downloadWooImageIfNeeded(imageUrl, wooId) {
+  if (!imageUrl) return null;
+
+  try {
+    const imagesDir = path.join(__dirname, '..', 'uploads', 'images');
+
+    if (!fs.existsSync(imagesDir)) {
+      fs.mkdirSync(imagesDir, {
+        recursive: true
+      });
+    }
+
+    const hash = crypto.createHash('md5').update(imageUrl).digest('hex').slice(0, 10);
+    const cleanExt = path.extname(new URL(imageUrl).pathname).replace(/[^a-zA-Z0-9.]/g, '') || '.jpg';
+    const ext = ['.jpg', '.jpeg', '.png', '.webp'].includes(cleanExt.toLowerCase()) ? cleanExt : '.jpg';
+    const filename = `woo_${wooId}_${hash}${ext}`;
+    const filepath = path.join(imagesDir, filename);
+
+    if (fs.existsSync(filepath)) {
+      return filename;
+    }
+
+    const response = await axios.get(imageUrl, {
+      responseType: 'arraybuffer',
+      timeout: 30000
+    });
+
+    fs.writeFileSync(filepath, response.data);
+
+    return filename;
+  } catch (error) {
+    console.error('No se pudo descargar imagen WooCommerce:', error.message);
+    return null;
+  }
+}
+
+async function upsertWooProduct(db, wooProduct, userId, options = {}) {
+  ensureSchema(db);
+
+  const localProducts = getLocalProducts(db);
+  const match = findLocalMatch(wooProduct, localProducts);
+  const existing = match.product;
+
+  const firstCategory = Array.isArray(wooProduct.categories) && wooProduct.categories[0] ? wooProduct.categories[0] : null;
+  const categoryId = getOrCreateCategory(db, firstCategory);
+  const brandId = getOrCreateBrand(db, wooProduct);
+
+  const regularPrice = Number(wooProduct.regular_price || wooProduct.price || 0) || 0;
+  const salePrice = wooProduct.sale_price ? Number(wooProduct.sale_price) || null : null;
+  const importedStatus = options.local_status || 'published';
+
+  let productId;
+
+  if (existing) {
+    db.prepare(`
+      UPDATE products
+      SET
+        name = ?,
+        short_description = ?,
+        description = ?,
+        brand_id = COALESCE(?, brand_id),
+        category_id = COALESCE(?, category_id),
+        model = ?,
+        type = ?,
+        sku = ?,
+        price = ?,
+        sale_price = ?,
+        stock_quantity = ?,
+        stock_status = ?,
+        status = ?,
+        wp_product_id = ?,
+        woo_id = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      wooProduct.name || existing.name,
+      wooProduct.short_description || '',
+      wooProduct.description || '',
+      brandId,
+      categoryId,
+      wooProduct.sku || existing.model || '',
+      wooProduct.type || 'simple',
+      wooProduct.sku || '',
+      regularPrice,
+      salePrice,
+      wooProduct.stock_quantity || 0,
+      wooProduct.stock_status || 'instock',
+      importedStatus,
+      wooProduct.id,
+      wooProduct.id,
+      existing.id
+    );
+
+    productId = existing.id;
+  } else {
+    const result = db.prepare(`
+      INSERT INTO products (
+        name,
+        short_description,
+        description,
+        brand_id,
+        category_id,
+        model,
+        type,
+        sku,
+        price,
+        sale_price,
+        stock_quantity,
+        stock_status,
+        youtube_url,
+        seo_keyword,
+        seo_title,
+        seo_description,
+        status,
+        wp_product_id,
+        woo_id,
+        created_by
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      wooProduct.name || 'Producto WooCommerce',
+      wooProduct.short_description || '',
+      wooProduct.description || '',
+      brandId,
+      categoryId,
+      wooProduct.sku || '',
+      wooProduct.type || 'simple',
+      wooProduct.sku || '',
+      regularPrice,
+      salePrice,
+      wooProduct.stock_quantity || 0,
+      wooProduct.stock_status || 'instock',
+      '',
+      wooProduct.name || '',
+      wooProduct.name || '',
+      stripHtml(wooProduct.short_description || wooProduct.description || '').slice(0, 155),
+      importedStatus,
+      wooProduct.id,
+      wooProduct.id,
+      userId || null
+    );
+
+    productId = result.lastInsertRowid;
+  }
+
+  db.prepare('DELETE FROM product_attributes WHERE product_id = ?').run(productId);
+
+  const attrStmt = db.prepare('INSERT INTO product_attributes (product_id, name, value) VALUES (?, ?, ?)');
+
+  (wooProduct.attributes || []).forEach((attr) => {
+    const value = Array.isArray(attr.options) ? attr.options.join(', ') : String(attr.option || attr.value || '');
+
+    if (attr.name && value) {
+      attrStmt.run(productId, attr.name, value);
+    }
+  });
+
+  const mainImageUrl = Array.isArray(wooProduct.images) && wooProduct.images[0] ? wooProduct.images[0].src : '';
+  const filename = await downloadWooImageIfNeeded(mainImageUrl, wooProduct.id);
+
+  if (filename) {
+    const existsImage = db
+      .prepare('SELECT id FROM product_images WHERE product_id = ? AND filename = ?')
+      .get(productId, filename);
+
+    if (!existsImage) {
+      db.prepare('UPDATE product_images SET is_main = 0 WHERE product_id = ?').run(productId);
+
+      db.prepare(`
+        INSERT INTO product_images (
+          product_id,
+          filename,
+          is_main,
+          sort_order
+        )
+        VALUES (?, ?, 1, 0)
+      `).run(productId, filename);
+    }
+  }
+
+  return {
+    product_id: productId,
+    woo_id: wooProduct.id,
+    updated: !!existing
+  };
+}
+
+async function publishLocalProductToWoo(config, db, product) {
+  const images = db
+    .prepare('SELECT filename FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC')
+    .all(product.id);
+
+  const attrs = db
+    .prepare('SELECT name, value FROM product_attributes WHERE product_id = ?')
+    .all(product.id);
+
+  const productData = {
+    name: product.name,
+    type: product.type || 'simple',
+    status: 'publish',
+    description: product.description || '',
+    short_description: product.short_description || '',
+    sku: product.sku || undefined,
+    regular_price: String(product.price || 0),
+    sale_price: product.sale_price ? String(product.sale_price) : undefined,
+    manage_stock: true,
+    stock_quantity: product.stock_quantity || 0,
+    stock_status: product.stock_status || 'instock',
+    categories: product.category_wp_id ? [{ id: product.category_wp_id }] : [],
+    attributes: attrs.map((attr) => ({
+      name: attr.name,
+      options: [attr.value],
+      visible: true
+    })),
+    images: images.map((img) => ({
+      src: `${BACKEND_URL}/uploads/images/${img.filename}`
+    }))
+  };
+
+  let response;
+
+  if (product.wp_product_id || product.woo_id) {
+    response = await wooRequest(config, 'PUT', `/products/${product.wp_product_id || product.woo_id}`, {
+      data: productData
+    });
+  } else {
+    response = await wooRequest(config, 'POST', '/products', {
+      data: productData
+    });
+  }
+
+  return response.data;
 }
 
 // GET /api/wordpress/status
 router.get('/status', authMiddleware, (req, res) => {
   try {
-    const db = getDb()
-    ensureSettingsTable(db)
-    const config = getWooConfig(db)
-    if (!config) return res.json({ connected: false, woo_url: null })
-    res.json({ connected: true, woo_url: config.woo_url, has_key: !!config.woo_key })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// POST /api/wordpress/config - guarda y prueba la conexión
-router.post('/config', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
-  try {
-    const { woo_url, woo_key, woo_secret } = req.body || {}
-    if (!woo_url || !woo_key || !woo_secret) {
-      return res.status(400).json({ error: 'URL, Consumer Key y Consumer Secret son requeridos' })
-    }
-    if (woo_key === '***' || woo_secret === '***') {
-      return res.status(400).json({ error: 'Ingresa las credenciales reales (no los asteriscos)' })
-    }
-
-    const baseUrl = woo_url.trim().replace(/\/$/, '')
-    const credentials = Buffer.from(`${woo_key.trim()}:${woo_secret.trim()}`).toString('base64')
-
-    // Test connection
-    try {
-      await httpRequest(`${baseUrl}/wp-json/wc/v3/products?per_page=1`, {
-        headers: { 'Authorization': `Basic ${credentials}` }
-      })
-    } catch (connErr) {
-      return res.status(400).json({
-        error: `No se pudo conectar a WooCommerce: ${connErr.message}. Verifica la URL y las credenciales.`
-      })
-    }
-
-    const config = { woo_url: baseUrl, woo_key: woo_key.trim(), woo_secret: woo_secret.trim() }
-    const db = getDb()
-    ensureSettingsTable(db)
-    const exists = db.prepare("SELECT id FROM settings WHERE key = 'woocommerce_config'").get()
-    if (exists) {
-      db.prepare("UPDATE settings SET value=?, updated_at=CURRENT_TIMESTAMP WHERE key='woocommerce_config'")
-        .run(JSON.stringify(config))
-    } else {
-      db.prepare("INSERT INTO settings (key, value) VALUES ('woocommerce_config', ?)").run(JSON.stringify(config))
-    }
-    res.json({ success: true, message: 'Conexión exitosa. Configuración guardada.' })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// POST /api/wordpress/sync-categories
-router.post('/sync-categories', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
-  try {
-    const db = getDb()
-    const config = getWooConfig(db)
-    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
-    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    let page = 1, total = 0
-    while (true) {
-      const cats = await httpRequest(
-        `${config.woo_url}/wp-json/wc/v3/products/categories?per_page=100&page=${page}`,
-        { headers: { 'Authorization': `Basic ${auth}` } }
-      )
-      if (!Array.isArray(cats) || !cats.length) break
-      for (const cat of cats) {
-        const slug = cat.slug || cat.name.toLowerCase().replace(/\s+/g, '-')
-        const exists = db.prepare('SELECT id FROM categories WHERE woo_id=?').get(cat.id)
-        if (exists) {
-          db.prepare('UPDATE categories SET name=?,slug=?,updated_at=CURRENT_TIMESTAMP WHERE woo_id=?').run(cat.name, slug, cat.id)
-        } else {
-          db.prepare('INSERT INTO categories (name,slug,woo_id) VALUES (?,?,?)').run(cat.name, slug, cat.id)
-        }
-        total++
-      }
-      if (cats.length < 100) break
-      page++
-    }
-    res.json({ success: true, message: `${total} categorías sincronizadas` })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// POST /api/wordpress/sync-products
-router.post('/sync-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
-  try {
-    const db = getDb()
-    const config = getWooConfig(db)
-    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
-    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    let page = 1, total = 0
-    while (true) {
-      const products = await httpRequest(
-        `${config.woo_url}/wp-json/wc/v3/products?per_page=50&page=${page}&status=publish`,
-        { headers: { 'Authorization': `Basic ${auth}` } }
-      )
-      if (!Array.isArray(products) || !products.length) break
-      for (const p of products) {
-        const exists = db.prepare('SELECT id FROM products WHERE woo_id=?').get(p.id)
-        const mainImg = p.images && p.images[0] ? p.images[0].src : null
-        if (exists) {
-          db.prepare(`UPDATE products SET name=?,sku=?,description=?,short_description=?,
-            price=?,sale_price=?,stock_quantity=?,stock_status=?,status=?,main_image=?,
-            updated_at=CURRENT_TIMESTAMP WHERE woo_id=?`)
-            .run(p.name, p.sku||'', p.description||'', p.short_description||'',
-              p.price||'0', p.sale_price||null, p.stock_quantity||0,
-              p.stock_status||'instock', 'publish', mainImg, p.id)
-        } else {
-          db.prepare(`INSERT INTO products (name,sku,description,short_description,
-            price,sale_price,stock_quantity,stock_status,status,main_image,woo_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-            .run(p.name, p.sku||'', p.description||'', p.short_description||'',
-              p.price||'0', p.sale_price||null, p.stock_quantity||0,
-              p.stock_status||'instock', 'publish', mainImg, p.id)
-        }
-        total++
-      }
-      if (products.length < 50) break
-      page++
-    }
-    res.json({ success: true, message: `${total} productos sincronizados` })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// POST /api/wordpress/publish-products
-router.post('/publish-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
-  try {
-    const db = getDb()
-    const config = getWooConfig(db)
-    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
-    const products = db.prepare("SELECT * FROM products WHERE (woo_id IS NULL OR woo_id='') AND status='publish' LIMIT 50").all()
-    if (!products.length) return res.json({ success: true, message: 'No hay productos nuevos para publicar' })
-    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    let published = 0, errors = 0
-    for (const p of products) {
-      try {
-        const body = JSON.stringify({
-          name: p.name, sku: p.sku||undefined,
-          description: p.description||'', short_description: p.short_description||'',
-          regular_price: String(p.price||'0'),
-          sale_price: p.sale_price ? String(p.sale_price) : undefined,
-          stock_quantity: p.stock_quantity||0, manage_stock: true, status: 'publish',
-        })
-        const woo = await httpRequest(`${config.woo_url}/wp-json/wc/v3/products`, {
-          method: 'POST',
-          headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-          body
-        })
-        if (woo.id) { db.prepare('UPDATE products SET woo_id=? WHERE id=?').run(woo.id, p.id); published++ }
-        else errors++
-      } catch { errors++ }
-    }
-    res.json({ success: true, message: `${published} publicados${errors ? `, ${errors} con error` : ''}` })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-module.exports = router
-
-// GET /api/wordpress/compare — compara WooCommerce vs local
-router.get('/compare', authMiddleware, async (req, res) => {
-  try {
-    const db = getDb()
-    const config = getWooConfig(db)
-    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
-
-    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    const headers = { 'Authorization': `Basic ${auth}` }
-
-    // Fetch all WooCommerce products
-    let wooProd = [], page = 1
-    while (true) {
-      const data = await httpRequest(
-        `${config.woo_url}/wp-json/wc/v3/products?per_page=100&page=${page}&status=any`,
-        { headers }
-      )
-      if (!Array.isArray(data) || !data.length) break
-      wooProd = wooProd.concat(data)
-      if (data.length < 100) break
-      page++
-    }
-
-    // Fetch all local products
-    const localProd = db.prepare('SELECT * FROM products').all()
-
-    // Build sets
-    const wooById = {}
-    for (const p of wooProd) wooById[p.id] = p
-
-    const localByWooId = {}
-    const localBySku = {}
-    for (const p of localProd) {
-      if (p.woo_id) localByWooId[p.woo_id] = p
-      if (p.sku) localBySku[p.sku] = p
-    }
-
-    const woo_only = []
-    const both = []
-    const matchedLocalIds = new Set()
-
-    for (const wp of wooProd) {
-      const localMatch = localByWooId[wp.id] || (wp.sku ? localBySku[wp.sku] : null)
-      const mainImg = wp.images && wp.images[0] ? wp.images[0].src : null
-      const catNames = wp.categories ? wp.categories.map(c => c.name).join(', ') : ''
-
-      if (localMatch) {
-        both.push({
-          id: localMatch.id,
-          woo_id: wp.id,
-          name: wp.name,
-          sku: wp.sku || localMatch.sku,
-          price: wp.price || localMatch.price,
-          sale_price: wp.sale_price || localMatch.sale_price,
-          stock_status: wp.stock_status || localMatch.stock_status,
-          main_image: mainImg || localMatch.main_image,
-          categories_names: catNames,
-        })
-        matchedLocalIds.add(localMatch.id)
-      } else {
-        woo_only.push({
-          woo_id: wp.id,
-          name: wp.name,
-          sku: wp.sku || '',
-          description: wp.description || '',
-          short_description: wp.short_description || '',
-          price: wp.price || '0',
-          sale_price: wp.sale_price || null,
-          stock_quantity: wp.stock_quantity || 0,
-          stock_status: wp.stock_status || 'instock',
-          main_image: mainImg,
-          categories_names: catNames,
-          categories: wp.categories || [],
-          images: wp.images || [],
-          weight: wp.weight || null,
-          attributes: wp.attributes || [],
-        })
-      }
-    }
-
-    const local_only = localProd.filter(p => !matchedLocalIds.has(p.id)).map(p => ({
-      id: p.id, name: p.name, sku: p.sku, price: p.price,
-      sale_price: p.sale_price, stock_status: p.stock_status, main_image: p.main_image,
-    }))
+    const config = getWooConfig();
+    const validationError = validateWooConfig(config);
 
     res.json({
-      woo_only,
-      local_only,
-      both,
-      summary: { woo_total: wooProd.length, local_total: localProd.length, synced: both.length }
-    })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
+      connected: !validationError,
+      configured: !validationError,
+      wc_url: config.url || null,
+      woo_url: config.url || null,
+      has_key: !!config.key,
+      has_secret: !!config.secret,
+      message: validationError || 'WooCommerce configurado.'
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Error consultando estado WooCommerce: ' + error.message
+    });
   }
-})
+});
 
-// POST /api/wordpress/import-selected — importa WooCommerce → local
-router.post('/import-selected', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+// GET /api/wordpress/config
+router.get('/config', authMiddleware, requireRole('admin', 'superadmin'), (req, res) => {
   try {
-    const db = getDb()
-    const config = getWooConfig(db)
-    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
+    const config = getWooConfig();
 
-    const { woo_ids = [] } = req.body
-    if (!woo_ids.length) return res.status(400).json({ error: 'No se seleccionaron productos' })
+    res.json({
+      wc_url: config.url,
+      woo_url: config.url,
+      wc_key: config.key,
+      woo_key: config.key,
+      wc_secret: config.secret ? SECRET_MASK : '',
+      woo_secret: config.secret ? SECRET_MASK : ''
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Error cargando configuración WooCommerce: ' + error.message
+    });
+  }
+});
 
-    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    let imported = 0, errors = 0
+// PUT /api/wordpress/config
+router.put('/config', authMiddleware, requireRole('admin', 'superadmin'), (req, res) => {
+  try {
+    const config = saveWooConfig(req.body || {});
+    const validationError = validateWooConfig(config);
 
-    for (const woo_id of woo_ids) {
-      try {
-        const wp = await httpRequest(
-          `${config.woo_url}/wp-json/wc/v3/products/${woo_id}`,
-          { headers: { Authorization: `Basic ${auth}` } }
-        )
-        const mainImg = wp.images && wp.images[0] ? wp.images[0].src : null
-        const catNames = wp.categories ? wp.categories.map(c => c.name).join(', ') : ''
-
-        const exists = db.prepare('SELECT id FROM products WHERE woo_id=?').get(woo_id)
-        if (exists) {
-          db.prepare(`UPDATE products SET name=?,sku=?,description=?,short_description=?,
-            price=?,sale_price=?,stock_quantity=?,stock_status=?,weight=?,main_image=?,
-            status='publish',updated_at=CURRENT_TIMESTAMP WHERE woo_id=?`)
-            .run(wp.name, wp.sku||'', wp.description||'', wp.short_description||'',
-              wp.price||'0', wp.sale_price||null, wp.stock_quantity||0,
-              wp.stock_status||'instock', wp.weight||null, mainImg, woo_id)
-        } else {
-          db.prepare(`INSERT INTO products (name,sku,description,short_description,
-            price,sale_price,stock_quantity,stock_status,weight,main_image,status,woo_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-            .run(wp.name, wp.sku||'', wp.description||'', wp.short_description||'',
-              wp.price||'0', wp.sale_price||null, wp.stock_quantity||0,
-              wp.stock_status||'instock', wp.weight||null, mainImg, 'publish', woo_id)
-        }
-        imported++
-      } catch { errors++ }
+    if (validationError) {
+      return res.status(400).json({
+        success: false,
+        error: validationError
+      });
     }
 
     res.json({
       success: true,
-      message: `${imported} productos importados${errors ? `, ${errors} errores` : ''}`
-    })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
+      message: 'Configuración WooCommerce guardada correctamente.',
+      wc_url: config.url,
+      woo_url: config.url
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Error guardando WooCommerce: ' + error.message
+    });
   }
-})
+});
 
-// POST /api/wordpress/push-selected — publica productos locales → WooCommerce
-router.post('/push-selected', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+// POST /api/wordpress/config
+router.post('/config', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
   try {
-    const db = getDb()
-    const config = getWooConfig(db)
-    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
+    const config = saveWooConfig(req.body || {});
+    const validationError = validateWooConfig(config);
 
-    const { local_ids = [] } = req.body
-    if (!local_ids.length) return res.status(400).json({ error: 'No se seleccionaron productos' })
-
-    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    let pushed = 0, errors = 0
-
-    for (const id of local_ids) {
-      const p = db.prepare('SELECT * FROM products WHERE id=?').get(id)
-      if (!p) { errors++; continue }
-      try {
-        const body = JSON.stringify({
-          name: p.name, sku: p.sku || undefined,
-          description: p.description || '', short_description: p.short_description || '',
-          regular_price: String(p.price || '0'),
-          sale_price: p.sale_price ? String(p.sale_price) : undefined,
-          stock_quantity: p.stock_quantity || 0, manage_stock: true, status: 'publish',
-        })
-        const woo = await httpRequest(`${config.woo_url}/wp-json/wc/v3/products`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Basic ${auth}`, 'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(body)
-          },
-          body
-        })
-        if (woo.id) {
-          db.prepare('UPDATE products SET woo_id=? WHERE id=?').run(woo.id, id)
-          pushed++
-        } else errors++
-      } catch { errors++ }
+    if (validationError) {
+      return res.status(400).json({
+        success: false,
+        error: validationError
+      });
     }
 
-    res.json({ success: true, message: `${pushed} publicados en WooCommerce${errors ? `, ${errors} errores` : ''}` })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
+    await wooRequest(config, 'GET', '/products', {
+      params: {
+        per_page: 1
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Conexión exitosa. Configuración guardada correctamente.',
+      wc_url: config.url,
+      woo_url: config.url
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
   }
-})
+});
+
+// POST /api/wordpress/test
+router.post('/test', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const config = getWooConfig(req.body || {});
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const response = await wooRequest(config, 'GET', '/products', {
+      params: {
+        per_page: 1
+      }
+    });
+
+    res.json({
+      success: true,
+      message: `Conexión exitosa. Productos detectados: ${response.headers['x-wp-total'] || '?'}.`,
+      site: config.url
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// GET /api/wordpress/preview-products
+router.get('/preview-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      connected: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const page = Math.max(Number(req.query.page || 1), 1);
+    const limit = Math.min(Math.max(Number(req.query.limit || 25), 1), 100);
+    const filter = req.query.filter || 'all';
+    const search = req.query.search || '';
+
+    const wooProducts = await getAllWooProducts(config, req.query.status || 'any');
+    const localProducts = getLocalProducts(db);
+
+    const wooRows = wooProducts.map((wooProduct) => {
+      return wooProductToRow(wooProduct, findLocalMatch(wooProduct, localProducts));
+    });
+
+    const wooIds = new Set(wooProducts.map((p) => Number(p.id)));
+
+    const systemOnlyRows = localProducts
+      .filter((p) => !p.wp_product_id && !p.woo_id || (!wooIds.has(Number(p.wp_product_id || p.woo_id || 0))))
+      .map((p) => ({
+        source: 'system',
+        woo_id: null,
+        local_id: p.id,
+        in_system: true,
+        linked: false,
+        only_woocommerce: false,
+        only_system: true,
+        needs_update: false,
+        suggested_action: p.wp_product_id || p.woo_id ? 'check' : 'publish_to_woo',
+        name: p.name,
+        sku: p.sku,
+        status: '',
+        price: p.price,
+        sale_price: p.sale_price,
+        stock_quantity: p.stock_quantity,
+        stock_status: p.stock_status,
+        image: p.main_image ? `${BACKEND_URL}/uploads/images/${p.main_image}` : '',
+        local_status: p.status,
+        local_name: p.name,
+        local_main_image: p.main_image ? `${BACKEND_URL}/uploads/images/${p.main_image}` : ''
+      }));
+
+    let rows;
+
+    if (filter === 'only_system' || filter === 'system_only') {
+      rows = systemOnlyRows;
+    } else if (filter === 'all_with_system') {
+      rows = [...wooRows, ...systemOnlyRows];
+    } else {
+      rows = wooRows;
+    }
+
+    rows = filterRows(rows, filter, search);
+
+    const total = rows.length;
+    const paged = rows.slice((page - 1) * limit, page * limit);
+
+    const stats = {
+      total_woocommerce: wooRows.length,
+      total_system: localProducts.length,
+      linked: wooRows.filter((r) => r.linked).length,
+      in_system: wooRows.filter((r) => r.in_system).length,
+      only_woocommerce: wooRows.filter((r) => r.only_woocommerce).length,
+      only_system: systemOnlyRows.length,
+      needs_update: wooRows.filter((r) => r.needs_update).length
+    };
+
+    res.json({
+      success: true,
+      connected: true,
+      stats,
+      rows: paged,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+      limit
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      connected: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// Alias viejo: GET /api/wordpress/compare
+router.get('/compare', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  req.query.filter = req.query.filter || 'all_with_system';
+
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const wooProducts = await getAllWooProducts(config, 'any');
+    const localProducts = getLocalProducts(db);
+
+    const wooRows = wooProducts.map((wooProduct) => {
+      return wooProductToRow(wooProduct, findLocalMatch(wooProduct, localProducts));
+    });
+
+    const wooOnly = wooRows.filter((row) => row.only_woocommerce);
+    const both = wooRows.filter((row) => row.in_system);
+    const matchedLocalIds = new Set(both.map((row) => row.local_id).filter(Boolean));
+
+    const localOnly = localProducts
+      .filter((p) => !matchedLocalIds.has(p.id))
+      .map((p) => ({
+        id: p.id,
+        local_id: p.id,
+        name: p.name,
+        sku: p.sku,
+        price: p.price,
+        sale_price: p.sale_price,
+        stock_status: p.stock_status,
+        main_image: p.main_image ? `${BACKEND_URL}/uploads/images/${p.main_image}` : '',
+        status: p.status
+      }));
+
+    res.json({
+      woo_only: wooOnly,
+      local_only: localOnly,
+      both,
+      summary: {
+        woo_total: wooProducts.length,
+        local_total: localProducts.length,
+        synced: both.length
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: cleanWooError(error)
+    });
+  }
+});
+
+// POST /api/wordpress/sync-categories
+router.post('/sync-categories', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    let page = 1;
+    let total = 0;
+
+    while (true) {
+      const { data } = await wooRequest(config, 'GET', '/products/categories', {
+        params: {
+          per_page: 100,
+          page,
+          hide_empty: false
+        }
+      });
+
+      if (!Array.isArray(data) || data.length === 0) break;
+
+      for (const cat of data) {
+        getOrCreateCategory(db, cat);
+        total += 1;
+      }
+
+      if (data.length < 100) break;
+
+      page += 1;
+    }
+
+    res.json({
+      success: true,
+      message: `${total} categorías sincronizadas correctamente.`,
+      total
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// POST /api/wordpress/import-products
+router.post('/import-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const mode = req.body?.mode || 'selected';
+    const wooIds = Array.isArray(req.body?.woo_ids) ? req.body.woo_ids.map(Number).filter(Boolean) : [];
+    const updateExisting = req.body?.update_existing !== false;
+
+    let wooProducts = [];
+
+    if (mode === 'all' || mode === 'missing' || mode === 'new') {
+      wooProducts = await getAllWooProducts(config, req.body?.woo_status || 'any');
+    } else {
+      if (wooIds.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Selecciona al menos un producto.'
+        });
+      }
+
+      for (const id of wooIds) {
+        wooProducts.push(await getWooProduct(config, id));
+      }
+    }
+
+    const localProducts = getLocalProducts(db);
+
+    if (mode === 'missing' || mode === 'new') {
+      wooProducts = wooProducts.filter((p) => !findLocalMatch(p, localProducts).product);
+    }
+
+    let imported = 0;
+    let updated = 0;
+    const errors = [];
+    const results = [];
+
+    for (const wooProduct of wooProducts) {
+      try {
+        const match = findLocalMatch(wooProduct, getLocalProducts(db));
+
+        if (match.product && !updateExisting) {
+          continue;
+        }
+
+        const result = await upsertWooProduct(db, wooProduct, req.user?.id || null, {
+          local_status: 'published'
+        });
+
+        if (result.updated) updated += 1;
+        else imported += 1;
+
+        results.push(result);
+      } catch (error) {
+        errors.push({
+          woo_id: wooProduct.id,
+          name: wooProduct.name,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${imported} productos importados, ${updated} actualizados${errors.length ? `, ${errors.length} con error` : ''}.`,
+      imported,
+      updated,
+      errors,
+      results
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// POST /api/wordpress/import-selected
+router.post('/import-selected', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  req.body.mode = 'selected';
+  req.body.woo_ids = req.body.woo_ids || req.body.ids || [];
+
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const wooIds = Array.isArray(req.body.woo_ids) ? req.body.woo_ids.map(Number).filter(Boolean) : [];
+
+    if (wooIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No se seleccionaron productos.'
+      });
+    }
+
+    let imported = 0;
+    let updated = 0;
+    const errors = [];
+
+    for (const id of wooIds) {
+      try {
+        const wooProduct = await getWooProduct(config, id);
+        const result = await upsertWooProduct(db, wooProduct, req.user?.id || null, {
+          local_status: 'published'
+        });
+
+        if (result.updated) updated += 1;
+        else imported += 1;
+      } catch (error) {
+        errors.push({
+          woo_id: id,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${imported} productos importados, ${updated} actualizados${errors.length ? `, ${errors.length} con error` : ''}.`,
+      imported,
+      updated,
+      errors
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// POST /api/wordpress/sync-products
+router.post('/sync-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const wooProducts = await getAllWooProducts(config, req.body?.woo_status || 'any');
+
+    let imported = 0;
+    let updated = 0;
+    const errors = [];
+
+    for (const wooProduct of wooProducts) {
+      try {
+        const result = await upsertWooProduct(db, wooProduct, req.user?.id || null, {
+          local_status: 'published'
+        });
+
+        if (result.updated) updated += 1;
+        else imported += 1;
+      } catch (error) {
+        errors.push({
+          woo_id: wooProduct.id,
+          name: wooProduct.name,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${imported} productos importados, ${updated} actualizados${errors.length ? `, ${errors.length} con error` : ''}.`,
+      imported,
+      updated,
+      errors
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// POST /api/wordpress/import-new-products
+router.post('/import-new-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const allWooProducts = await getAllWooProducts(config, req.body?.woo_status || 'any');
+    const localProducts = getLocalProducts(db);
+    const missingProducts = allWooProducts.filter((p) => !findLocalMatch(p, localProducts).product);
+
+    let imported = 0;
+    const errors = [];
+
+    for (const wooProduct of missingProducts) {
+      try {
+        await upsertWooProduct(db, wooProduct, req.user?.id || null, {
+          local_status: 'published'
+        });
+
+        imported += 1;
+      } catch (error) {
+        errors.push({
+          woo_id: wooProduct.id,
+          name: wooProduct.name,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${imported} productos nuevos importados desde WooCommerce.`,
+      imported,
+      errors
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// POST /api/wordpress/publish-selected
+router.post('/publish-selected', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const ids = Array.isArray(req.body?.product_ids)
+      ? req.body.product_ids.map(Number).filter(Boolean)
+      : Array.isArray(req.body?.local_ids)
+        ? req.body.local_ids.map(Number).filter(Boolean)
+        : [];
+
+    if (ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Selecciona al menos un producto del sistema.'
+      });
+    }
+
+    const placeholders = ids.map(() => '?').join(',');
+
+    const products = db.prepare(`
+      SELECT
+        p.*,
+        c.wp_id AS category_wp_id
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      WHERE p.id IN (${placeholders})
+    `).all(...ids);
+
+    let published = 0;
+    const errors = [];
+
+    for (const product of products) {
+      try {
+        const woo = await publishLocalProductToWoo(config, db, product);
+
+        db.prepare(`
+          UPDATE products
+          SET
+            wp_product_id = ?,
+            woo_id = ?,
+            status = ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(woo.id, woo.id, 'published', product.id);
+
+        published += 1;
+      } catch (error) {
+        errors.push({
+          product_id: product.id,
+          name: product.name,
+          error: error.response?.data?.message || error.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${published} productos publicados en WooCommerce${errors.length ? `, ${errors.length} con error` : ''}.`,
+      published,
+      errors
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// POST /api/wordpress/push-selected
+router.post('/push-selected', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  req.body.product_ids = req.body.product_ids || req.body.local_ids || [];
+
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const ids = Array.isArray(req.body.product_ids) ? req.body.product_ids.map(Number).filter(Boolean) : [];
+
+    if (ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No se seleccionaron productos.'
+      });
+    }
+
+    const placeholders = ids.map(() => '?').join(',');
+
+    const products = db.prepare(`
+      SELECT
+        p.*,
+        c.wp_id AS category_wp_id
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      WHERE p.id IN (${placeholders})
+    `).all(...ids);
+
+    let pushed = 0;
+    const errors = [];
+
+    for (const product of products) {
+      try {
+        const woo = await publishLocalProductToWoo(config, db, product);
+
+        db.prepare(`
+          UPDATE products
+          SET
+            wp_product_id = ?,
+            woo_id = ?,
+            status = ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(woo.id, woo.id, 'published', product.id);
+
+        pushed += 1;
+      } catch (error) {
+        errors.push({
+          product_id: product.id,
+          name: product.name,
+          error: error.response?.data?.message || error.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${pushed} productos publicados en WooCommerce${errors.length ? `, ${errors.length} con error` : ''}.`,
+      pushed,
+      errors
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+// POST /api/wordpress/publish/:id
+router.post('/publish/:id', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const config = getWooConfig();
+  const validationError = validateWooConfig(config);
+
+  if (validationError) {
+    return res.status(400).json({
+      success: false,
+      error: validationError
+    });
+  }
+
+  try {
+    const db = getDb();
+
+    ensureSchema(db);
+
+    const product = db.prepare(`
+      SELECT
+        p.*,
+        c.wp_id AS category_wp_id
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      WHERE p.id = ?
+    `).get(req.params.id);
+
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: 'Producto no encontrado.'
+      });
+    }
+
+    const woo = await publishLocalProductToWoo(config, db, product);
+
+    db.prepare(`
+      UPDATE products
+      SET
+        wp_product_id = ?,
+        woo_id = ?,
+        status = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(woo.id, woo.id, 'published', product.id);
+
+    res.json({
+      success: true,
+      message: 'Producto publicado correctamente en WooCommerce.',
+      wp_product_id: woo.id,
+      wp_url: woo.permalink
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: cleanWooError(error),
+      details: error.response?.data || null
+    });
+  }
+});
+
+module.exports = router;
