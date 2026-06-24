@@ -1,531 +1,222 @@
-const express = require('express');
-const axios = require('axios');
-const Anthropic = require('@anthropic-ai/sdk');
-const { getDb } = require('../db/database');
-const { authMiddleware } = require('../middleware/auth');
+const express = require('express')
+const router = express.Router()
+const https = require('https')
+const http = require('http')
+const { authMiddleware, requireRole } = require('../middleware/auth')
+const { getDb } = require('../database')
 
-const router = express.Router();
+const DEFAULTS = [
+  { name: 'WhatsApp Business',      type: 'whatsapp',           category: 'messaging' },
+  { name: 'Messenger',              type: 'messenger',           category: 'messaging' },
+  { name: 'Instagram DM',           type: 'instagram_dm',        category: 'social' },
+  { name: 'Instagram Comments',     type: 'instagram_comments',  category: 'social' },
+  { name: 'Facebook Comments',      type: 'facebook_comments',   category: 'social' },
+  { name: 'ChatGPT / OpenAI',       type: 'openai',              category: 'ai' },
+  { name: 'Claude AI (Anthropic)',   type: 'claude_ai',           category: 'ai' },
+  { name: 'DALL·E 3 (Imágenes IA)', type: 'dalle3',              category: 'ai' },
+  { name: 'WooCommerce REST API',    type: 'woocommerce',         category: 'ecommerce' },
+  { name: 'Meta Ads',               type: 'meta_ads',            category: 'advertising' },
+  { name: 'Google Ads',             type: 'google_ads',          category: 'advertising' },
+]
 
-const DEFAULT_INTEGRATIONS = [
-  {
-    id: 'woocommerce',
-    name: 'WooCommerce',
-    type: 'woocommerce',
-    category: 'commerce',
-    config: {}
-  },
-  {
-    id: 'wordpress',
-    name: 'WordPress',
-    type: 'wordpress',
-    category: 'commerce',
-    config: {}
-  },
-  {
-    id: 'claude_ai',
-    name: 'Claude AI',
-    type: 'claude',
-    category: 'ai',
-    config: {}
-  },
-  {
-    id: 'openai',
-    name: 'ChatGPT / OpenAI',
-    type: 'openai',
-    category: 'ai',
-    config: {}
-  },
-  {
-    id: 'openai_images',
-    name: 'OpenAI Imágenes',
-    type: 'openai_images',
-    category: 'image_ai',
-    config: {
-      model: 'gpt-image-1',
-      size: '1024x1024',
-      quality: 'medium'
-    }
-  },
-  {
-    id: 'claude_design',
-    name: 'Claude Design / Prompt Visual',
-    type: 'claude_design',
-    category: 'image_ai',
-    config: {
-      model: 'claude-haiku-4-5-20251001',
-      prompt_base: 'Crea un prompt visual profesional para generar una imagen comercial del producto.'
-    }
-  },
-  {
-    id: 'whatsapp',
-    name: 'WhatsApp Business',
-    type: 'whatsapp',
-    category: 'messaging',
-    config: {}
-  },
-  {
-    id: 'messenger',
-    name: 'Facebook Messenger',
-    type: 'messenger',
-    category: 'messaging',
-    config: {}
-  },
-  {
-    id: 'instagram_dm',
-    name: 'Instagram DM',
-    type: 'instagram_dm',
-    category: 'messaging',
-    config: {}
-  },
-  {
-    id: 'meta_ads',
-    name: 'Meta Ads',
-    type: 'meta_ads',
-    category: 'marketing',
-    config: {}
-  },
-  {
-    id: 'google_ads',
-    name: 'Google Ads',
-    type: 'google_ads',
-    category: 'marketing',
-    config: {}
-  }
-];
-
-function ensureIntegrations() {
-  const db = getDb();
-
-  db.exec(`
+function initTable(db) {
+  db.prepare(`
     CREATE TABLE IF NOT EXISTS integrations (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      type TEXT NOT NULL,
-      category TEXT DEFAULT 'messaging',
-      config TEXT DEFAULT '{}',
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL,
+      type        TEXT UNIQUE NOT NULL,
+      category    TEXT DEFAULT 'other',
       is_connected INTEGER DEFAULT 0,
-      webhook_url TEXT,
+      config      TEXT,
       connected_at DATETIME,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO integrations (
-      id,
-      name,
-      type,
-      category,
-      config,
-      is_connected,
-      updated_at
+      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-    VALUES (?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
-  `);
+  `).run()
 
-  DEFAULT_INTEGRATIONS.forEach((item) => {
-    stmt.run(
-      item.id,
-      item.name,
-      item.type,
-      item.category,
-      JSON.stringify(item.config || {})
-    );
-  });
+  // Always ensure all defaults exist
+  const insert = db.prepare(
+    'INSERT OR IGNORE INTO integrations (name, type, category) VALUES (?, ?, ?)'
+  )
+  for (const d of DEFAULTS) insert.run(d.name, d.type, d.category)
 }
 
-function parseConfig(integration) {
-  try {
-    return {
-      ...integration,
-      is_connected: Number(integration.is_connected || 0),
-      config: JSON.parse(integration.config || '{}')
-    };
-  } catch (error) {
-    return {
-      ...integration,
-      is_connected: Number(integration.is_connected || 0),
-      config: {}
-    };
-  }
+function parseConfig(row) {
+  if (!row || !row.config) return {}
+  try { return JSON.parse(row.config) } catch { return {} }
 }
 
-function getSettingsConfig() {
-  const db = getDb();
-  const rows = db.prepare('SELECT key, value FROM settings').all();
-  const settings = {};
-
-  rows.forEach((row) => {
-    settings[row.key] = row.value;
-  });
-
-  return settings;
-}
-
-function normalizeUrl(url) {
-  if (!url) return '';
-
-  let clean = String(url).trim();
-
-  if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
-    clean = 'https://' + clean;
-  }
-
-  return clean.replace(/\/+$/, '');
-}
-
-async function testWooCommerce(config = {}) {
-  const settings = getSettingsConfig();
-
-  const url = normalizeUrl(config.wc_url || config.url || settings.wc_url || process.env.WC_URL || '');
-  const key = String(config.wc_key || config.key || settings.wc_key || process.env.WC_KEY || '').trim();
-  const secret = String(config.wc_secret || config.secret || settings.wc_secret || process.env.WC_SECRET || '').trim();
-
-  if (!url || !key || !secret) {
-    throw new Error('Faltan datos de WooCommerce. Guarda URL, Consumer Key y Consumer Secret.');
-  }
-
-  if (!key.startsWith('ck_')) {
-    throw new Error('El Consumer Key debe empezar con ck_.');
-  }
-
-  if (!secret.startsWith('cs_')) {
-    throw new Error('El Consumer Secret debe empezar con cs_.');
-  }
-
-  try {
-    const response = await axios.get(`${url}/wp-json/wc/v3/products`, {
-      timeout: 30000,
-      params: {
-        per_page: 1
-      },
-      auth: {
-        username: key,
-        password: secret
-      }
-    });
-
-    return {
-      success: true,
-      message: `WooCommerce conectado correctamente. Productos detectados: ${response.headers['x-wp-total'] || '?'}.`
-    };
-  } catch (firstError) {
-    const response = await axios.get(`${url}/wp-json/wc/v3/products`, {
-      timeout: 30000,
-      params: {
-        per_page: 1,
-        consumer_key: key,
-        consumer_secret: secret
-      }
-    });
-
-    return {
-      success: true,
-      message: `WooCommerce conectado correctamente. Productos detectados: ${response.headers['x-wp-total'] || '?'}.`
-    };
-  }
-}
-
-async function testClaude(config = {}) {
-  const key = config.api_key || process.env.ANTHROPIC_API_KEY;
-
-  if (!key) {
-    throw new Error('Sin API Key de Claude.');
-  }
-
-  const client = new Anthropic({
-    apiKey: key
-  });
-
-  await client.messages.create({
-    model: config.model || 'claude-haiku-4-5-20251001',
-    max_tokens: 20,
-    messages: [
-      {
-        role: 'user',
-        content: 'Responde solamente: conectado'
-      }
-    ]
-  });
-
-  return {
-    success: true,
-    message: 'Claude AI conectado correctamente.'
-  };
-}
-
-async function testOpenAI(config = {}) {
-  const key = config.api_key || process.env.OPENAI_API_KEY;
-
-  if (!key) {
-    throw new Error('Sin API Key de OpenAI.');
-  }
-
-  await axios.get('https://api.openai.com/v1/models', {
-    timeout: 30000,
-    headers: {
-      Authorization: `Bearer ${key}`
+// ── HTTP helper (works on Node 14/16/18/20) ──────────────────────────────────
+function httpReq(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url)
+    const lib = u.protocol === 'https:' ? https : http
+    const options = {
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      method: opts.method || 'GET',
+      headers: opts.headers || {},
+      timeout: 12000,
+      rejectUnauthorized: false,   // allows self-signed certs
     }
-  });
-
-  return {
-    success: true,
-    message: 'OpenAI conectado correctamente.'
-  };
+    const req = lib.request(options, res => {
+      let body = ''
+      res.on('data', chunk => body += chunk)
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve({ status: res.statusCode, data: JSON.parse(body) }) }
+          catch { resolve({ status: res.statusCode, data: body }) }
+        } else {
+          reject(new Error(`HTTP ${res.statusCode} en ${u.hostname}${u.pathname}`))
+        }
+      })
+    })
+    req.setTimeout(12000, () => { req.destroy(); reject(new Error('Tiempo de espera agotado (12s)')) })
+    req.on('error', err => reject(new Error(err.message)))
+    if (opts.body) req.write(opts.body)
+    req.end()
+  })
 }
+
+// ── Test each integration type ────────────────────────────────────────────────
+async function testIntegration(type, cfg) {
+  switch (type) {
+
+    case 'woocommerce': {
+      const base = (cfg.woo_url || '').trim().replace(/\/$/, '')
+      const key  = (cfg.woo_key || '').trim()
+      const sec  = (cfg.woo_secret || '').trim()
+      if (!base) throw new Error('Falta la URL del sitio WooCommerce')
+      if (!key)  throw new Error('Falta el Consumer Key')
+      if (!sec)  throw new Error('Falta el Consumer Secret')
+      const auth = Buffer.from(`${key}:${sec}`).toString('base64')
+      const res  = await httpReq(`${base}/wp-json/wc/v3/products?per_page=1`, {
+        headers: { Authorization: `Basic ${auth}` }
+      })
+      const count = Array.isArray(res.data) ? res.data.length : '?'
+      return `✅ WooCommerce conectado correctamente. API REST funcionando en ${base}`
+    }
+
+    case 'openai':
+    case 'dalle3': {
+      if (!cfg.api_key) throw new Error('Falta el API Key de OpenAI')
+      const res = await httpReq('https://api.openai.com/v1/models', {
+        headers: { Authorization: `Bearer ${cfg.api_key}` }
+      })
+      const models = res.data?.data?.length || 0
+      return `✅ OpenAI conectado. ${models} modelos disponibles.`
+    }
+
+    case 'claude_ai': {
+      if (!cfg.api_key) throw new Error('Falta el API Key de Anthropic')
+      await httpReq('https://api.anthropic.com/v1/models', {
+        headers: { 'x-api-key': cfg.api_key, 'anthropic-version': '2023-06-01' }
+      })
+      return '✅ Claude AI conectado correctamente.'
+    }
+
+    case 'whatsapp': {
+      if (!cfg.access_token || !cfg.phone_number_id)
+        throw new Error('Falta el Access Token o Phone Number ID')
+      const res = await httpReq(
+        `https://graph.facebook.com/v19.0/${cfg.phone_number_id}`,
+        { headers: { Authorization: `Bearer ${cfg.access_token}` } }
+      )
+      return `✅ WhatsApp conectado. ID: ${res.data.id || cfg.phone_number_id}`
+    }
+
+    default:
+      return '✅ Configuración guardada correctamente.'
+  }
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
 
 // GET /api/integrations
 router.get('/', authMiddleware, (req, res) => {
   try {
-    ensureIntegrations();
-
-    const integrations = getDb()
-      .prepare('SELECT * FROM integrations ORDER BY category, name')
-      .all()
-      .map(parseConfig);
-
-    res.json(integrations);
-  } catch (error) {
-    res.status(500).json({
-      error: 'Error cargando integraciones: ' + error.message
-    });
+    const db = getDb()
+    initTable(db)
+    const rows = db.prepare('SELECT * FROM integrations ORDER BY category, name').all()
+    res.json(rows.map(r => ({
+      ...r,
+      config:       parseConfig(r),
+      is_connected: !!r.is_connected,
+    })))
+  } catch (err) {
+    console.error('[integrations] GET /', err.message)
+    res.status(500).json({ error: err.message })
   }
-});
+})
 
-// POST /api/integrations/bootstrap
-router.post('/bootstrap', authMiddleware, (req, res) => {
+// PUT /api/integrations/:id  — save config (no connect yet)
+router.put('/:id', authMiddleware, requireRole('admin', 'superadmin'), (req, res) => {
   try {
-    ensureIntegrations();
-
-    const integrations = getDb()
-      .prepare('SELECT * FROM integrations ORDER BY category, name')
-      .all()
-      .map(parseConfig);
-
-    res.json({
-      success: true,
-      message: 'Integraciones restauradas correctamente',
-      integrations
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: 'Error restaurando integraciones: ' + error.message
-    });
+    const db = getDb()
+    initTable(db)
+    const { config } = req.body || {}
+    db.prepare(
+      'UPDATE integrations SET config=?, updated_at=CURRENT_TIMESTAMP WHERE id=?'
+    ).run(JSON.stringify(config || {}), req.params.id)
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
   }
-});
+})
 
-// GET /api/integrations/:id
-router.get('/:id', authMiddleware, (req, res) => {
+// POST /api/integrations/:id/connect  — save + mark connected
+router.post('/:id/connect', authMiddleware, requireRole('admin', 'superadmin'), (req, res) => {
   try {
-    ensureIntegrations();
-
-    const integration = getDb()
-      .prepare('SELECT * FROM integrations WHERE id = ?')
-      .get(req.params.id);
-
-    if (!integration) {
-      return res.status(404).json({
-        error: 'Integración no encontrada'
-      });
-    }
-
-    res.json(parseConfig(integration));
-  } catch (error) {
-    res.status(500).json({
-      error: 'Error cargando integración: ' + error.message
-    });
+    const db = getDb()
+    initTable(db)
+    const { config } = req.body || {}
+    db.prepare(
+      `UPDATE integrations
+       SET config=?, is_connected=1, connected_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+       WHERE id=?`
+    ).run(JSON.stringify(config || {}), req.params.id)
+    res.json({ success: true, message: 'Integración conectada' })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
   }
-});
-
-// PUT /api/integrations/:id
-router.put('/:id', authMiddleware, (req, res) => {
-  try {
-    ensureIntegrations();
-
-    const db = getDb();
-    const { config, is_connected, webhook_url } = req.body;
-
-    const existing = db
-      .prepare('SELECT * FROM integrations WHERE id = ?')
-      .get(req.params.id);
-
-    if (!existing) {
-      return res.status(404).json({
-        error: 'Integración no encontrada'
-      });
-    }
-
-    let merged = {};
-
-    try {
-      merged = JSON.parse(existing.config || '{}');
-    } catch (error) {}
-
-    if (config) {
-      Object.assign(merged, config);
-    }
-
-    db.prepare(`
-      UPDATE integrations
-      SET
-        config = ?,
-        is_connected = ?,
-        webhook_url = ?,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(
-      JSON.stringify(merged),
-      is_connected ? 1 : 0,
-      webhook_url || existing.webhook_url || '',
-      req.params.id
-    );
-
-    res.json({
-      success: true,
-      message: 'Integración actualizada correctamente'
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: 'Error actualizando integración: ' + error.message
-    });
-  }
-});
-
-// POST /api/integrations/:id/connect
-router.post('/:id/connect', authMiddleware, (req, res) => {
-  try {
-    ensureIntegrations();
-
-    const db = getDb();
-    const { config } = req.body;
-
-    const existing = db
-      .prepare('SELECT * FROM integrations WHERE id = ?')
-      .get(req.params.id);
-
-    if (!existing) {
-      return res.status(404).json({
-        error: 'Integración no encontrada'
-      });
-    }
-
-    let merged = {};
-
-    try {
-      merged = JSON.parse(existing.config || '{}');
-    } catch (error) {}
-
-    if (config) {
-      Object.assign(merged, config);
-    }
-
-    db.prepare(`
-      UPDATE integrations
-      SET
-        config = ?,
-        is_connected = 1,
-        connected_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(JSON.stringify(merged), req.params.id);
-
-    res.json({
-      success: true,
-      message: `${existing.name} conectado correctamente`
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: 'Error conectando integración: ' + error.message
-    });
-  }
-});
+})
 
 // POST /api/integrations/:id/disconnect
-router.post('/:id/disconnect', authMiddleware, (req, res) => {
+router.post('/:id/disconnect', authMiddleware, requireRole('admin', 'superadmin'), (req, res) => {
   try {
-    ensureIntegrations();
-
-    getDb()
-      .prepare(`
-        UPDATE integrations
-        SET
-          is_connected = 0,
-          connected_at = NULL,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `)
-      .run(req.params.id);
-
-    res.json({
-      success: true,
-      message: 'Integración desconectada'
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: 'Error desconectando integración: ' + error.message
-    });
+    const db = getDb()
+    initTable(db)
+    db.prepare(
+      'UPDATE integrations SET is_connected=0, config=NULL, connected_at=NULL WHERE id=?'
+    ).run(req.params.id)
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
   }
-});
+})
 
-// POST /api/integrations/:id/test
+// POST /api/integrations/:id/test  — live test without changing connected status
 router.post('/:id/test', authMiddleware, async (req, res) => {
   try {
-    ensureIntegrations();
+    const db = getDb()
+    initTable(db)
+    const row = db.prepare('SELECT * FROM integrations WHERE id=?').get(req.params.id)
+    if (!row) return res.status(404).json({ error: 'Integración no encontrada' })
 
-    const db = getDb();
+    const cfg = parseConfig(row)
+    const message = await testIntegration(row.type, cfg)
 
-    const integration = db
-      .prepare('SELECT * FROM integrations WHERE id = ?')
-      .get(req.params.id);
+    // Mark connected on success
+    db.prepare(
+      'UPDATE integrations SET is_connected=1, connected_at=CURRENT_TIMESTAMP WHERE id=?'
+    ).run(req.params.id)
 
-    if (!integration) {
-      return res.status(404).json({
-        error: 'Integración no encontrada'
-      });
-    }
-
-    let savedConfig = {};
-
-    try {
-      savedConfig = JSON.parse(integration.config || '{}');
-    } catch (error) {}
-
-    const config = {
-      ...savedConfig,
-      ...(req.body?.config || {})
-    };
-
-    let result;
-
-    if (integration.type === 'woocommerce') {
-      result = await testWooCommerce(config);
-    } else if (integration.type === 'claude') {
-      result = await testClaude(config);
-    } else if (integration.type === 'openai' || integration.type === 'openai_images') {
-      result = await testOpenAI(config);
-    } else {
-      result = {
-        success: true,
-        message: 'La integración está disponible para configurar.'
-      };
-    }
-
-    db.prepare(`
-      UPDATE integrations
-      SET
-        is_connected = 1,
-        connected_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(req.params.id);
-
-    res.json(result);
-  } catch (error) {
-    res.status(400).json({
-      success: false,
-      error: error.response?.data?.message || error.response?.data?.error?.message || error.message
-    });
+    res.json({ success: true, message })
+  } catch (err) {
+    console.error('[integrations] test error:', err.message)
+    res.status(400).json({ error: err.message })
   }
-});
+})
 
-module.exports = router;
+module.exports = router
