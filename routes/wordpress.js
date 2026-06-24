@@ -1,137 +1,201 @@
-const express = require('express');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
-const FormData = require('form-data');
-const { getDb } = require('../db/database');
-const { authMiddleware, requireRole } = require('../middleware/auth');
-const router = express.Router();
+const express = require('express')
+const router = express.Router()
+const { authMiddleware, requireRole } = require('../middleware/auth')
+const { getDb } = require('../database')
 
-function getWooConfig() {
-  const db = getDb();
-  const url = db.prepare("SELECT value FROM settings WHERE key='wc_url'").get()?.value || process.env.WC_URL;
-  const key = db.prepare("SELECT value FROM settings WHERE key='wc_key'").get()?.value || process.env.WC_KEY;
-  const secret = db.prepare("SELECT value FROM settings WHERE key='wc_secret'").get()?.value || process.env.WC_SECRET;
-  return { url, key, secret };
+// Helper: get WooCommerce config from DB
+function getWooConfig(db) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'woocommerce_config'").get()
+  if (!row) return null
+  try { return JSON.parse(row.value) } catch { return null }
 }
 
-function wooClient(config) {
-  return axios.create({
-    baseURL: `${config.url}/wp-json/wc/v3`,
-    auth: { username: config.key, password: config.secret },
-    timeout: 30000
-  });
+// Helper: test WooCommerce connection
+async function testWooConnection(config) {
+  const { woo_url, woo_key, woo_secret } = config
+  if (!woo_url || !woo_key || !woo_secret) throw new Error('Faltan credenciales')
+  const url = `${woo_url.replace(/\/$/, '')}/wp-json/wc/v3/system_status`
+  const credentials = Buffer.from(`${woo_key}:${woo_secret}`).toString('base64')
+  const res = await fetch(url, {
+    headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/json' }
+  })
+  if (!res.ok) throw new Error(`WooCommerce respondió ${res.status}`)
+  return await res.json()
 }
 
-router.post('/test', authMiddleware, requireRole('superadmin', 'admin'), async (req, res) => {
-  const config = getWooConfig();
-  if (!config.url || !config.key || !config.secret) return res.status(400).json({ error: 'Configura WooCommerce primero' });
+// GET /api/wordpress/status - retorna config actual y estado de conexión
+router.get('/status', authMiddleware, (req, res) => {
   try {
-    const r = await wooClient(config).get('/products?per_page=1');
-    res.json({ success: true, message: `Conexión exitosa. ${r.headers['x-wp-total'] || '?'} productos.` });
+    const db = getDb()
+    const config = getWooConfig(db)
+    if (!config) return res.json({ connected: false, woo_url: null })
+    res.json({
+      connected: true,
+      woo_url: config.woo_url,
+      has_key: !!config.woo_key,
+      has_secret: !!config.woo_secret,
+    })
   } catch (err) {
-    res.status(400).json({ error: 'Error: ' + (err.response?.data?.message || err.message) });
+    res.status(500).json({ error: err.message })
   }
-});
+})
 
-router.post('/sync-categories', authMiddleware, requireRole('superadmin', 'admin'), async (req, res) => {
-  const config = getWooConfig();
-  try {
-    const db = getDb();
-    const { data } = await wooClient(config).get('/products/categories?per_page=100');
-    const stmt = db.prepare('INSERT OR IGNORE INTO categories (name, slug, wp_id) VALUES (?, ?, ?)');
-    let added = 0;
-    data.forEach(cat => { try { stmt.run(cat.name, cat.slug, cat.id); added++; } catch(e) {} });
-    res.json({ message: `${added} categorías importadas`, total: data.length });
-  } catch (err) {
-    res.status(400).json({ error: 'Error: ' + (err.response?.data?.message || err.message) });
+// POST /api/wordpress/config - guarda y prueba la conexión WooCommerce
+router.post('/config', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  const { woo_url, woo_key, woo_secret } = req.body
+  if (!woo_url || !woo_key || !woo_secret) {
+    return res.status(400).json({ error: 'URL, Consumer Key y Consumer Secret son requeridos' })
   }
-});
-
-router.post('/sync-brands', authMiddleware, requireRole('superadmin', 'admin'), async (req, res) => {
-  const config = getWooConfig();
+  // Don't save placeholder values
+  if (woo_key === '***' || woo_secret === '***') {
+    return res.status(400).json({ error: 'Ingresa las credenciales reales' })
+  }
   try {
-    const db = getDb();
-    const attrsRes = await wooClient(config).get('/products/attributes?per_page=100');
-    const brandAttr = attrsRes.data.find(a => ['marca','brand','fabricante'].includes(a.slug.toLowerCase()) || a.name.toLowerCase().includes('marca'));
-    let brands = [];
-    if (brandAttr) {
-      const termsRes = await wooClient(config).get(`/products/attributes/${brandAttr.id}/terms?per_page=100`);
-      brands = termsRes.data.map(t => ({ name: t.name, slug: t.slug }));
+    const config = {
+      woo_url: woo_url.trim().replace(/\/$/, ''),
+      woo_key: woo_key.trim(),
+      woo_secret: woo_secret.trim(),
     }
-    const stmt = db.prepare('INSERT OR IGNORE INTO brands (name, slug) VALUES (?, ?)');
-    let added = 0;
-    brands.forEach(b => { try { stmt.run(b.name, b.slug); added++; } catch(e) {} });
-    res.json({ message: `${added} marcas importadas`, total: brands.length });
-  } catch (err) {
-    res.status(400).json({ error: 'Error: ' + (err.response?.data?.message || err.message) });
-  }
-});
-
-router.post('/sync-attributes', authMiddleware, requireRole('superadmin', 'admin'), async (req, res) => {
-  const config = getWooConfig();
-  try {
-    const db = getDb();
-    const { data } = await wooClient(config).get('/products/attributes?per_page=100');
-    const stmt = db.prepare('INSERT OR IGNORE INTO attribute_templates (name, unit) VALUES (?, ?)');
-    let added = 0;
-    data.forEach(a => {
-      const unitMatch = a.name.match(/\(([^)]+)\)$/);
-      const unit = unitMatch ? unitMatch[1] : '';
-      const cleanName = a.name.replace(/\s*\([^)]+\)$/, '').trim();
-      try { stmt.run(cleanName, unit); added++; } catch(e) {}
-    });
-    res.json({ message: `${added} atributos importados`, total: data.length });
-  } catch (err) {
-    res.status(400).json({ error: 'Error: ' + (err.response?.data?.message || err.message) });
-  }
-});
-
-router.post('/publish/:id', authMiddleware, requireRole('superadmin', 'admin'), async (req, res) => {
-  const db = getDb();
-  const product = db.prepare('SELECT p.*, c.wp_id as category_wp_id FROM products p LEFT JOIN categories c ON p.category_id=c.id WHERE p.id=?').get(req.params.id);
-  if (!product) return res.status(404).json({ error: 'Producto no encontrado' });
-  const config = getWooConfig();
-  const woo = wooClient(config);
-  const images = db.prepare('SELECT * FROM product_images WHERE product_id=? ORDER BY is_main DESC, sort_order').all(req.params.id);
-  const attributes = db.prepare('SELECT * FROM product_attributes WHERE product_id=?').all(req.params.id);
-
-  try {
-    const wpImages = [];
-    for (const img of images) {
-      try {
-        const imgPath = path.join(__dirname, '..', 'uploads', 'images', img.filename);
-        if (!fs.existsSync(imgPath)) continue;
-        const form = new FormData();
-        form.append('file', fs.createReadStream(imgPath), img.filename);
-        const wpRes = await axios.post(`${config.url}/wp-json/wp/v2/media`, form, { headers: form.getHeaders(), auth: { username: config.key, password: config.secret } });
-        wpImages.push({ id: wpRes.data.id, src: wpRes.data.source_url });
-      } catch(e) {}
-    }
-
-    const productData = {
-      name: product.name, type: product.type || 'simple', status: 'publish',
-      description: product.description || '', short_description: product.short_description || '',
-      sku: product.sku || '', regular_price: String(product.price || 0),
-      sale_price: product.sale_price ? String(product.sale_price) : '',
-      manage_stock: true, stock_quantity: product.stock_quantity || 0,
-      stock_status: product.stock_status || 'instock', images: wpImages,
-      attributes: attributes.map(a => ({ name: a.name, options: [a.value], visible: true })),
-      categories: product.category_wp_id ? [{ id: product.category_wp_id }] : [],
-    };
-
-    let response;
-    if (product.wp_product_id) {
-      response = await woo.put(`/products/${product.wp_product_id}`, productData);
+    // Test connection before saving
+    await testWooConnection(config)
+    // Save to DB
+    const db = getDb()
+    const exists = db.prepare("SELECT id FROM settings WHERE key = 'woocommerce_config'").get()
+    if (exists) {
+      db.prepare("UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'woocommerce_config'")
+        .run(JSON.stringify(config))
     } else {
-      response = await woo.post('/products', productData);
+      db.prepare("INSERT INTO settings (key, value) VALUES ('woocommerce_config', ?)")
+        .run(JSON.stringify(config))
     }
-
-    db.prepare('UPDATE products SET wp_product_id=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(response.data.id, 'published', req.params.id);
-    res.json({ success: true, wp_product_id: response.data.id, wp_url: response.data.permalink });
+    res.json({ success: true, message: 'Conexión exitosa. Configuración guardada.' })
   } catch (err) {
-    res.status(400).json({ error: 'Error WooCommerce: ' + (err.response?.data?.message || err.message) });
+    res.status(400).json({ error: `No se pudo conectar: ${err.message}` })
   }
-});
+})
 
-module.exports = router;
+// POST /api/wordpress/sync-categories - importa categorías desde WooCommerce
+router.post('/sync-categories', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  try {
+    const db = getDb()
+    const config = getWooConfig(db)
+    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
+
+    const base = config.woo_url
+    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
+    const headers = { Authorization: `Basic ${auth}` }
+
+    let page = 1, total = 0
+    while (true) {
+      const r = await fetch(`${base}/wp-json/wc/v3/products/categories?per_page=100&page=${page}`, { headers })
+      if (!r.ok) throw new Error(`Error ${r.status}`)
+      const cats = await r.json()
+      if (!cats.length) break
+      for (const cat of cats) {
+        const exists = db.prepare('SELECT id FROM categories WHERE woo_id = ?').get(cat.id)
+        const slug = cat.slug || cat.name.toLowerCase().replace(/\s+/g, '-')
+        if (exists) {
+          db.prepare('UPDATE categories SET name=?, slug=?, parent_id=?, updated_at=CURRENT_TIMESTAMP WHERE woo_id=?')
+            .run(cat.name, slug, cat.parent || null, cat.id)
+        } else {
+          db.prepare('INSERT INTO categories (name, slug, woo_id, parent_id) VALUES (?,?,?,?)')
+            .run(cat.name, slug, cat.id, cat.parent || null)
+        }
+        total++
+      }
+      if (cats.length < 100) break
+      page++
+    }
+    res.json({ success: true, message: `${total} categorías sincronizadas` })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/wordpress/sync-products - importa productos desde WooCommerce
+router.post('/sync-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  try {
+    const db = getDb()
+    const config = getWooConfig(db)
+    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
+
+    const base = config.woo_url
+    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
+    const headers = { Authorization: `Basic ${auth}` }
+
+    let page = 1, total = 0
+    while (true) {
+      const r = await fetch(`${base}/wp-json/wc/v3/products?per_page=50&page=${page}&status=publish`, { headers })
+      if (!r.ok) throw new Error(`Error ${r.status}`)
+      const products = await r.json()
+      if (!products.length) break
+      for (const p of products) {
+        const exists = db.prepare('SELECT id FROM products WHERE woo_id = ?').get(p.id)
+        const data = [
+          p.name, p.slug || '', p.sku || '', p.description || '',
+          p.short_description || '', p.price || '0', p.sale_price || null,
+          p.stock_quantity || 0, p.stock_status || 'instock',
+          p.weight || null, 'publish', p.id
+        ]
+        if (exists) {
+          db.prepare(`UPDATE products SET name=?,slug=?,sku=?,description=?,short_description=?,
+            price=?,sale_price=?,stock_quantity=?,stock_status=?,weight=?,status=?,updated_at=CURRENT_TIMESTAMP
+            WHERE woo_id=?`).run(...data)
+        } else {
+          db.prepare(`INSERT INTO products (name,slug,sku,description,short_description,
+            price,sale_price,stock_quantity,stock_status,weight,status,woo_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(...data)
+        }
+        total++
+      }
+      if (products.length < 50) break
+      page++
+    }
+    res.json({ success: true, message: `${total} productos sincronizados desde WooCommerce` })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /api/wordpress/publish-products - publica productos locales a WooCommerce
+router.post('/publish-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
+  try {
+    const db = getDb()
+    const config = getWooConfig(db)
+    if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
+
+    const products = db.prepare("SELECT * FROM products WHERE (woo_id IS NULL OR woo_id = '') AND status = 'publish' LIMIT 50").all()
+    if (!products.length) return res.json({ success: true, message: 'No hay productos nuevos para publicar' })
+
+    const base = config.woo_url
+    const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
+    const headers = { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' }
+
+    let published = 0, errors = 0
+    for (const p of products) {
+      try {
+        const body = {
+          name: p.name, sku: p.sku || undefined,
+          description: p.description || '', short_description: p.short_description || '',
+          regular_price: String(p.price || '0'),
+          sale_price: p.sale_price ? String(p.sale_price) : undefined,
+          stock_quantity: p.stock_quantity || 0,
+          manage_stock: true, status: 'publish',
+        }
+        const r = await fetch(`${base}/wp-json/wc/v3/products`, {
+          method: 'POST', headers, body: JSON.stringify(body)
+        })
+        if (r.ok) {
+          const woo = await r.json()
+          db.prepare('UPDATE products SET woo_id=? WHERE id=?').run(woo.id, p.id)
+          published++
+        } else { errors++ }
+      } catch { errors++ }
+    }
+    res.json({ success: true, message: `${published} publicados${errors ? `, ${errors} errores` : ''}` })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+module.exports = router
