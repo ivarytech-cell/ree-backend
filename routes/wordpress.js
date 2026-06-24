@@ -43,6 +43,7 @@ function ensureSchema(db) {
       slug TEXT,
       parent_id INTEGER,
       wp_id INTEGER,
+      woo_id INTEGER,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -75,6 +76,7 @@ function ensureSchema(db) {
       seo_description TEXT,
       status TEXT DEFAULT 'draft',
       wp_product_id INTEGER,
+      woo_id INTEGER,
       created_by INTEGER,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -980,7 +982,10 @@ router.get('/preview-products', authMiddleware, requireRole('admin', 'superadmin
     const wooIds = new Set(wooProducts.map((p) => Number(p.id)));
 
     const systemOnlyRows = localProducts
-      .filter((p) => !p.wp_product_id && !p.woo_id || (!wooIds.has(Number(p.wp_product_id || p.woo_id || 0))))
+      .filter((p) => {
+        const linkedId = Number(p.wp_product_id || p.woo_id || 0);
+        return !linkedId || !wooIds.has(linkedId);
+      })
       .map((p) => ({
         source: 'system',
         woo_id: null,
@@ -1049,10 +1054,8 @@ router.get('/preview-products', authMiddleware, requireRole('admin', 'superadmin
   }
 });
 
-// Alias viejo: GET /api/wordpress/compare
+// GET /api/wordpress/compare
 router.get('/compare', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
-  req.query.filter = req.query.filter || 'all_with_system';
-
   const config = getWooConfig();
   const validationError = validateWooConfig(config);
 
