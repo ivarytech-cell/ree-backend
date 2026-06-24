@@ -1,105 +1,132 @@
 const express = require('express')
 const router = express.Router()
+const https = require('https')
+const http = require('http')
 const { authMiddleware, requireRole } = require('../middleware/auth')
 const { getDb } = require('../database')
 
-// Helper: get WooCommerce config from DB
+// Ensure settings table exists
+function ensureSettingsTable(db) {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS settings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key TEXT UNIQUE NOT NULL,
+      value TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run()
+}
+
 function getWooConfig(db) {
+  ensureSettingsTable(db)
   const row = db.prepare("SELECT value FROM settings WHERE key = 'woocommerce_config'").get()
   if (!row) return null
   try { return JSON.parse(row.value) } catch { return null }
 }
 
-// Helper: test WooCommerce connection
-async function testWooConnection(config) {
-  const { woo_url, woo_key, woo_secret } = config
-  if (!woo_url || !woo_key || !woo_secret) throw new Error('Faltan credenciales')
-  const url = `${woo_url.replace(/\/$/, '')}/wp-json/wc/v3/system_status`
-  const credentials = Buffer.from(`${woo_key}:${woo_secret}`).toString('base64')
-  const res = await fetch(url, {
-    headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/json' }
+// Simple HTTP request helper (compatible with any Node version)
+function httpRequest(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url)
+    const lib = parsedUrl.protocol === 'https:' ? https : http
+    const req = lib.request({
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      method: options.method || 'GET',
+      headers: options.headers || {},
+    }, (res) => {
+      let data = ''
+      res.on('data', chunk => data += chunk)
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve(JSON.parse(data)) } catch { resolve(data) }
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`))
+        }
+      })
+    })
+    req.on('error', reject)
+    if (options.body) req.write(options.body)
+    req.end()
   })
-  if (!res.ok) throw new Error(`WooCommerce respondió ${res.status}`)
-  return await res.json()
 }
 
-// GET /api/wordpress/status - retorna config actual y estado de conexión
+// GET /api/wordpress/status
 router.get('/status', authMiddleware, (req, res) => {
   try {
     const db = getDb()
+    ensureSettingsTable(db)
     const config = getWooConfig(db)
     if (!config) return res.json({ connected: false, woo_url: null })
-    res.json({
-      connected: true,
-      woo_url: config.woo_url,
-      has_key: !!config.woo_key,
-      has_secret: !!config.woo_secret,
-    })
+    res.json({ connected: true, woo_url: config.woo_url, has_key: !!config.woo_key })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
 
-// POST /api/wordpress/config - guarda y prueba la conexión WooCommerce
+// POST /api/wordpress/config - guarda y prueba la conexión
 router.post('/config', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
-  const { woo_url, woo_key, woo_secret } = req.body
-  if (!woo_url || !woo_key || !woo_secret) {
-    return res.status(400).json({ error: 'URL, Consumer Key y Consumer Secret son requeridos' })
-  }
-  // Don't save placeholder values
-  if (woo_key === '***' || woo_secret === '***') {
-    return res.status(400).json({ error: 'Ingresa las credenciales reales' })
-  }
   try {
-    const config = {
-      woo_url: woo_url.trim().replace(/\/$/, ''),
-      woo_key: woo_key.trim(),
-      woo_secret: woo_secret.trim(),
+    const { woo_url, woo_key, woo_secret } = req.body || {}
+    if (!woo_url || !woo_key || !woo_secret) {
+      return res.status(400).json({ error: 'URL, Consumer Key y Consumer Secret son requeridos' })
     }
-    // Test connection before saving
-    await testWooConnection(config)
-    // Save to DB
+    if (woo_key === '***' || woo_secret === '***') {
+      return res.status(400).json({ error: 'Ingresa las credenciales reales (no los asteriscos)' })
+    }
+
+    const baseUrl = woo_url.trim().replace(/\/$/, '')
+    const credentials = Buffer.from(`${woo_key.trim()}:${woo_secret.trim()}`).toString('base64')
+
+    // Test connection
+    try {
+      await httpRequest(`${baseUrl}/wp-json/wc/v3/products?per_page=1`, {
+        headers: { 'Authorization': `Basic ${credentials}` }
+      })
+    } catch (connErr) {
+      return res.status(400).json({
+        error: `No se pudo conectar a WooCommerce: ${connErr.message}. Verifica la URL y las credenciales.`
+      })
+    }
+
+    const config = { woo_url: baseUrl, woo_key: woo_key.trim(), woo_secret: woo_secret.trim() }
     const db = getDb()
+    ensureSettingsTable(db)
     const exists = db.prepare("SELECT id FROM settings WHERE key = 'woocommerce_config'").get()
     if (exists) {
-      db.prepare("UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'woocommerce_config'")
+      db.prepare("UPDATE settings SET value=?, updated_at=CURRENT_TIMESTAMP WHERE key='woocommerce_config'")
         .run(JSON.stringify(config))
     } else {
-      db.prepare("INSERT INTO settings (key, value) VALUES ('woocommerce_config', ?)")
-        .run(JSON.stringify(config))
+      db.prepare("INSERT INTO settings (key, value) VALUES ('woocommerce_config', ?)").run(JSON.stringify(config))
     }
     res.json({ success: true, message: 'Conexión exitosa. Configuración guardada.' })
   } catch (err) {
-    res.status(400).json({ error: `No se pudo conectar: ${err.message}` })
+    res.status(500).json({ error: err.message })
   }
 })
 
-// POST /api/wordpress/sync-categories - importa categorías desde WooCommerce
+// POST /api/wordpress/sync-categories
 router.post('/sync-categories', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
   try {
     const db = getDb()
     const config = getWooConfig(db)
     if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
-
-    const base = config.woo_url
     const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    const headers = { Authorization: `Basic ${auth}` }
-
     let page = 1, total = 0
     while (true) {
-      const r = await fetch(`${base}/wp-json/wc/v3/products/categories?per_page=100&page=${page}`, { headers })
-      if (!r.ok) throw new Error(`Error ${r.status}`)
-      const cats = await r.json()
-      if (!cats.length) break
+      const cats = await httpRequest(
+        `${config.woo_url}/wp-json/wc/v3/products/categories?per_page=100&page=${page}`,
+        { headers: { 'Authorization': `Basic ${auth}` } }
+      )
+      if (!Array.isArray(cats) || !cats.length) break
       for (const cat of cats) {
-        const exists = db.prepare('SELECT id FROM categories WHERE woo_id = ?').get(cat.id)
         const slug = cat.slug || cat.name.toLowerCase().replace(/\s+/g, '-')
+        const exists = db.prepare('SELECT id FROM categories WHERE woo_id=?').get(cat.id)
         if (exists) {
-          db.prepare('UPDATE categories SET name=?, slug=?, parent_id=?, updated_at=CURRENT_TIMESTAMP WHERE woo_id=?')
-            .run(cat.name, slug, cat.parent || null, cat.id)
+          db.prepare('UPDATE categories SET name=?,slug=?,updated_at=CURRENT_TIMESTAMP WHERE woo_id=?').run(cat.name, slug, cat.id)
         } else {
-          db.prepare('INSERT INTO categories (name, slug, woo_id, parent_id) VALUES (?,?,?,?)')
-            .run(cat.name, slug, cat.id, cat.parent || null)
+          db.prepare('INSERT INTO categories (name,slug,woo_id) VALUES (?,?,?)').run(cat.name, slug, cat.id)
         }
         total++
       }
@@ -112,87 +139,78 @@ router.post('/sync-categories', authMiddleware, requireRole('admin', 'superadmin
   }
 })
 
-// POST /api/wordpress/sync-products - importa productos desde WooCommerce
+// POST /api/wordpress/sync-products
 router.post('/sync-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
   try {
     const db = getDb()
     const config = getWooConfig(db)
     if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
-
-    const base = config.woo_url
     const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    const headers = { Authorization: `Basic ${auth}` }
-
     let page = 1, total = 0
     while (true) {
-      const r = await fetch(`${base}/wp-json/wc/v3/products?per_page=50&page=${page}&status=publish`, { headers })
-      if (!r.ok) throw new Error(`Error ${r.status}`)
-      const products = await r.json()
-      if (!products.length) break
+      const products = await httpRequest(
+        `${config.woo_url}/wp-json/wc/v3/products?per_page=50&page=${page}&status=publish`,
+        { headers: { 'Authorization': `Basic ${auth}` } }
+      )
+      if (!Array.isArray(products) || !products.length) break
       for (const p of products) {
-        const exists = db.prepare('SELECT id FROM products WHERE woo_id = ?').get(p.id)
-        const data = [
-          p.name, p.slug || '', p.sku || '', p.description || '',
-          p.short_description || '', p.price || '0', p.sale_price || null,
-          p.stock_quantity || 0, p.stock_status || 'instock',
-          p.weight || null, 'publish', p.id
-        ]
+        const exists = db.prepare('SELECT id FROM products WHERE woo_id=?').get(p.id)
+        const mainImg = p.images && p.images[0] ? p.images[0].src : null
         if (exists) {
-          db.prepare(`UPDATE products SET name=?,slug=?,sku=?,description=?,short_description=?,
-            price=?,sale_price=?,stock_quantity=?,stock_status=?,weight=?,status=?,updated_at=CURRENT_TIMESTAMP
-            WHERE woo_id=?`).run(...data)
+          db.prepare(`UPDATE products SET name=?,sku=?,description=?,short_description=?,
+            price=?,sale_price=?,stock_quantity=?,stock_status=?,status=?,main_image=?,
+            updated_at=CURRENT_TIMESTAMP WHERE woo_id=?`)
+            .run(p.name, p.sku||'', p.description||'', p.short_description||'',
+              p.price||'0', p.sale_price||null, p.stock_quantity||0,
+              p.stock_status||'instock', 'publish', mainImg, p.id)
         } else {
-          db.prepare(`INSERT INTO products (name,slug,sku,description,short_description,
-            price,sale_price,stock_quantity,stock_status,weight,status,woo_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(...data)
+          db.prepare(`INSERT INTO products (name,sku,description,short_description,
+            price,sale_price,stock_quantity,stock_status,status,main_image,woo_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(p.name, p.sku||'', p.description||'', p.short_description||'',
+              p.price||'0', p.sale_price||null, p.stock_quantity||0,
+              p.stock_status||'instock', 'publish', mainImg, p.id)
         }
         total++
       }
       if (products.length < 50) break
       page++
     }
-    res.json({ success: true, message: `${total} productos sincronizados desde WooCommerce` })
+    res.json({ success: true, message: `${total} productos sincronizados` })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
 
-// POST /api/wordpress/publish-products - publica productos locales a WooCommerce
+// POST /api/wordpress/publish-products
 router.post('/publish-products', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
   try {
     const db = getDb()
     const config = getWooConfig(db)
     if (!config) return res.status(400).json({ error: 'WooCommerce no configurado' })
-
-    const products = db.prepare("SELECT * FROM products WHERE (woo_id IS NULL OR woo_id = '') AND status = 'publish' LIMIT 50").all()
+    const products = db.prepare("SELECT * FROM products WHERE (woo_id IS NULL OR woo_id='') AND status='publish' LIMIT 50").all()
     if (!products.length) return res.json({ success: true, message: 'No hay productos nuevos para publicar' })
-
-    const base = config.woo_url
     const auth = Buffer.from(`${config.woo_key}:${config.woo_secret}`).toString('base64')
-    const headers = { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' }
-
     let published = 0, errors = 0
     for (const p of products) {
       try {
-        const body = {
-          name: p.name, sku: p.sku || undefined,
-          description: p.description || '', short_description: p.short_description || '',
-          regular_price: String(p.price || '0'),
+        const body = JSON.stringify({
+          name: p.name, sku: p.sku||undefined,
+          description: p.description||'', short_description: p.short_description||'',
+          regular_price: String(p.price||'0'),
           sale_price: p.sale_price ? String(p.sale_price) : undefined,
-          stock_quantity: p.stock_quantity || 0,
-          manage_stock: true, status: 'publish',
-        }
-        const r = await fetch(`${base}/wp-json/wc/v3/products`, {
-          method: 'POST', headers, body: JSON.stringify(body)
+          stock_quantity: p.stock_quantity||0, manage_stock: true, status: 'publish',
         })
-        if (r.ok) {
-          const woo = await r.json()
-          db.prepare('UPDATE products SET woo_id=? WHERE id=?').run(woo.id, p.id)
-          published++
-        } else { errors++ }
+        const woo = await httpRequest(`${config.woo_url}/wp-json/wc/v3/products`, {
+          method: 'POST',
+          headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          body
+        })
+        if (woo.id) { db.prepare('UPDATE products SET woo_id=? WHERE id=?').run(woo.id, p.id); published++ }
+        else errors++
       } catch { errors++ }
     }
-    res.json({ success: true, message: `${published} publicados${errors ? `, ${errors} errores` : ''}` })
+    res.json({ success: true, message: `${published} publicados${errors ? `, ${errors} con error` : ''}` })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
