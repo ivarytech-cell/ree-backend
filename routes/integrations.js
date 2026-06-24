@@ -95,12 +95,28 @@ function ensureSettingsTable(db) {
   `);
 }
 
+function getColumns(db, table) {
+  try {
+    return db.prepare(`PRAGMA table_info(${table})`).all().map((col) => col.name);
+  } catch (error) {
+    return [];
+  }
+}
+
+function addColumnIfMissing(db, table, column, definition) {
+  const columns = getColumns(db, table);
+
+  if (!columns.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
 function ensureIntegrationsTable(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS integrations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
-      type TEXT UNIQUE NOT NULL,
+      type TEXT NOT NULL,
       category TEXT DEFAULT 'other',
       is_connected INTEGER DEFAULT 0,
       config TEXT DEFAULT '{}',
@@ -111,40 +127,70 @@ function ensureIntegrationsTable(db) {
     );
   `);
 
-  const columns = db.prepare(`PRAGMA table_info(integrations)`).all().map((col) => col.name);
-
-  if (!columns.includes('webhook_url')) {
-    db.exec(`ALTER TABLE integrations ADD COLUMN webhook_url TEXT`);
-  }
-
-  if (!columns.includes('connected_at')) {
-    db.exec(`ALTER TABLE integrations ADD COLUMN connected_at DATETIME`);
-  }
-
-  if (!columns.includes('updated_at')) {
-    db.exec(`ALTER TABLE integrations ADD COLUMN updated_at DATETIME`);
-  }
-
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO integrations (
-      name,
-      type,
-      category,
-      config,
-      is_connected,
-      updated_at
-    )
-    VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
-  `);
+  addColumnIfMissing(db, 'integrations', 'name', 'TEXT');
+  addColumnIfMissing(db, 'integrations', 'type', 'TEXT');
+  addColumnIfMissing(db, 'integrations', 'category', "TEXT DEFAULT 'other'");
+  addColumnIfMissing(db, 'integrations', 'is_connected', 'INTEGER DEFAULT 0');
+  addColumnIfMissing(db, 'integrations', 'config', "TEXT DEFAULT '{}'");
+  addColumnIfMissing(db, 'integrations', 'webhook_url', 'TEXT');
+  addColumnIfMissing(db, 'integrations', 'connected_at', 'DATETIME');
+  addColumnIfMissing(db, 'integrations', 'created_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
+  addColumnIfMissing(db, 'integrations', 'updated_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
 
   DEFAULT_INTEGRATIONS.forEach((item) => {
-    insert.run(
-      item.name,
-      item.type,
-      item.category,
-      JSON.stringify(item.config || {})
-    );
+    const existing = db.prepare('SELECT rowid, * FROM integrations WHERE type = ? ORDER BY rowid ASC LIMIT 1').get(item.type);
+
+    if (existing) {
+      db.prepare(`
+        UPDATE integrations
+        SET
+          name = ?,
+          category = ?,
+          config = CASE WHEN config IS NULL OR config = '' THEN ? ELSE config END,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE rowid = ?
+      `).run(
+        item.name,
+        item.category,
+        JSON.stringify(item.config || {}),
+        existing.rowid
+      );
+    } else {
+      db.prepare(`
+        INSERT INTO integrations (
+          name,
+          type,
+          category,
+          config,
+          is_connected,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+      `).run(
+        item.name,
+        item.type,
+        item.category,
+        JSON.stringify(item.config || {})
+      );
+    }
   });
+
+  // Elimina duplicados dejando solo el primer registro de cada tipo.
+  try {
+    db.prepare(`
+      DELETE FROM integrations
+      WHERE rowid NOT IN (
+        SELECT MIN(rowid)
+        FROM integrations
+        WHERE type IS NOT NULL AND type != ''
+        GROUP BY type
+      )
+      AND type IS NOT NULL
+      AND type != ''
+    `).run();
+  } catch (error) {
+    console.error('No se pudieron limpiar duplicados de integraciones:', error.message);
+  }
 }
 
 function parseConfig(value) {
@@ -157,10 +203,6 @@ function parseConfig(value) {
   } catch (error) {
     return {};
   }
-}
-
-function maskSecret(value) {
-  return value ? SECRET_MASK : '';
 }
 
 function normalizeUrl(url) {
@@ -409,10 +451,17 @@ async function testOpenAI(config = {}) {
 
 function cleanIntegrationForResponse(row) {
   const config = parseConfig(row.config);
-
   const safeConfig = { ...config };
 
-  ['api_key', 'access_token', 'secret', 'wc_secret', 'woo_secret', 'openai_key', 'anthropic_key'].forEach((key) => {
+  [
+    'api_key',
+    'access_token',
+    'secret',
+    'wc_secret',
+    'woo_secret',
+    'openai_key',
+    'anthropic_key'
+  ].forEach((key) => {
     if (safeConfig[key]) {
       safeConfig[key] = SECRET_MASK;
     }
@@ -425,10 +474,16 @@ function cleanIntegrationForResponse(row) {
   };
 }
 
-function updateIntegration(db, id, data = {}) {
+function findIntegration(db, idOrType) {
+  return db
+    .prepare('SELECT rowid, * FROM integrations WHERE CAST(id AS TEXT) = ? OR type = ? LIMIT 1')
+    .get(String(idOrType), String(idOrType));
+}
+
+function updateIntegration(db, idOrType, data = {}) {
   ensureIntegrationsTable(db);
 
-  const existing = db.prepare('SELECT * FROM integrations WHERE id = ? OR type = ?').get(id, id);
+  const existing = findIntegration(db, idOrType);
 
   if (!existing) {
     throw new Error('Integración no encontrada.');
@@ -440,6 +495,10 @@ function updateIntegration(db, id, data = {}) {
     ...(data.config || {})
   };
 
+  const nextConnected = data.is_connected === undefined
+    ? Number(existing.is_connected || 0)
+    : data.is_connected ? 1 : 0;
+
   db.prepare(`
     UPDATE integrations
     SET
@@ -448,16 +507,16 @@ function updateIntegration(db, id, data = {}) {
       webhook_url = ?,
       connected_at = CASE WHEN ? = 1 THEN COALESCE(connected_at, CURRENT_TIMESTAMP) ELSE connected_at END,
       updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
+    WHERE rowid = ?
   `).run(
     JSON.stringify(newConfig),
-    data.is_connected ? 1 : Number(existing.is_connected || 0),
+    nextConnected,
     data.webhook_url || existing.webhook_url || '',
-    data.is_connected ? 1 : 0,
-    existing.id
+    nextConnected,
+    existing.rowid
   );
 
-  return db.prepare('SELECT * FROM integrations WHERE id = ?').get(existing.id);
+  return db.prepare('SELECT rowid, * FROM integrations WHERE rowid = ?').get(existing.rowid);
 }
 
 // GET /api/integrations
@@ -469,7 +528,7 @@ router.get('/', authMiddleware, (req, res) => {
     ensureIntegrationsTable(db);
 
     const rows = db
-      .prepare('SELECT * FROM integrations ORDER BY category, name')
+      .prepare('SELECT rowid, * FROM integrations ORDER BY category, name')
       .all()
       .map(cleanIntegrationForResponse);
 
@@ -491,7 +550,7 @@ router.post('/bootstrap', authMiddleware, requireRole('admin', 'superadmin'), (r
     ensureIntegrationsTable(db);
 
     const rows = db
-      .prepare('SELECT * FROM integrations ORDER BY category, name')
+      .prepare('SELECT rowid, * FROM integrations ORDER BY category, name')
       .all()
       .map(cleanIntegrationForResponse);
 
@@ -515,9 +574,7 @@ router.get('/:id', authMiddleware, (req, res) => {
     ensureSettingsTable(db);
     ensureIntegrationsTable(db);
 
-    const row = db
-      .prepare('SELECT * FROM integrations WHERE id = ? OR type = ?')
-      .get(req.params.id, req.params.id);
+    const row = findIntegration(db, req.params.id);
 
     if (!row) {
       return res.status(404).json({
@@ -571,9 +628,7 @@ router.post('/:id/connect', authMiddleware, requireRole('admin', 'superadmin'), 
     ensureSettingsTable(db);
     ensureIntegrationsTable(db);
 
-    const existing = db
-      .prepare('SELECT * FROM integrations WHERE id = ? OR type = ?')
-      .get(req.params.id, req.params.id);
+    const existing = findIntegration(db, req.params.id);
 
     if (!existing) {
       return res.status(404).json({
@@ -604,7 +659,7 @@ router.post('/:id/connect', authMiddleware, requireRole('admin', 'superadmin'), 
       result = await testOpenAI(config);
     }
 
-    const updated = updateIntegration(db, existing.id, {
+    const updated = updateIntegration(db, existing.rowid, {
       config,
       is_connected: true,
       webhook_url: req.body?.webhook_url
@@ -633,9 +688,7 @@ router.post('/:id/test', authMiddleware, requireRole('admin', 'superadmin'), asy
     ensureSettingsTable(db);
     ensureIntegrationsTable(db);
 
-    const existing = db
-      .prepare('SELECT * FROM integrations WHERE id = ? OR type = ?')
-      .get(req.params.id, req.params.id);
+    const existing = findIntegration(db, req.params.id);
 
     if (!existing) {
       return res.status(404).json({
@@ -662,7 +715,7 @@ router.post('/:id/test', authMiddleware, requireRole('admin', 'superadmin'), asy
       result = await testOpenAI(config);
     }
 
-    const updated = updateIntegration(db, existing.id, {
+    const updated = updateIntegration(db, existing.rowid, {
       config,
       is_connected: true
     });
@@ -690,9 +743,7 @@ router.post('/:id/disconnect', authMiddleware, requireRole('admin', 'superadmin'
     ensureSettingsTable(db);
     ensureIntegrationsTable(db);
 
-    const existing = db
-      .prepare('SELECT * FROM integrations WHERE id = ? OR type = ?')
-      .get(req.params.id, req.params.id);
+    const existing = findIntegration(db, req.params.id);
 
     if (!existing) {
       return res.status(404).json({
@@ -706,8 +757,8 @@ router.post('/:id/disconnect', authMiddleware, requireRole('admin', 'superadmin'
         is_connected = 0,
         connected_at = NULL,
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(existing.id);
+      WHERE rowid = ?
+    `).run(existing.rowid);
 
     res.json({
       success: true,
