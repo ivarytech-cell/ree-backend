@@ -125,7 +125,6 @@ const ALIASES = {
 
 function normalizeType(value) {
   const clean = String(value || '').trim().toLowerCase();
-
   return ALIASES[clean] || clean;
 }
 
@@ -181,14 +180,12 @@ function normalizeUrl(url) {
 function extractAnthropicKey(value) {
   const text = String(value || '').trim();
   const match = text.match(/sk-ant-[A-Za-z0-9_\-]+/);
-
   return match ? match[0] : text;
 }
 
 function extractOpenAIKey(value) {
   const text = String(value || '').trim();
   const match = text.match(/sk-[A-Za-z0-9_\-]+/);
-
   return match ? match[0] : text;
 }
 
@@ -203,7 +200,6 @@ function getSetting(db, key, fallback = '') {
 
 function saveSetting(db, key, value) {
   ensureSettingsTable(db);
-
   db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value || '');
 }
 
@@ -218,6 +214,14 @@ function getSettings(db) {
   });
 
   return settings;
+}
+
+function readApiKeyFromConfig(config = {}, possibleKeys = []) {
+  for (const key of possibleKeys) {
+    if (config[key]) return config[key];
+  }
+
+  return '';
 }
 
 function getWooConfigFromSettingsAndConfig(db, config = {}) {
@@ -352,14 +356,6 @@ async function testWooCommerce(config) {
       message: `WooCommerce conectado correctamente. Productos detectados: ${response.headers['x-wp-total'] || '?'}.`
     };
   }
-}
-
-function readApiKeyFromConfig(config = {}, possibleKeys = []) {
-  for (const key of possibleKeys) {
-    if (config[key]) return config[key];
-  }
-
-  return '';
 }
 
 async function testClaude(config = {}) {
@@ -564,8 +560,6 @@ function ensureIntegrationsTable(db) {
   addColumnIfMissing(db, 'integrations', 'config', "TEXT DEFAULT '{}'");
   addColumnIfMissing(db, 'integrations', 'webhook_url', 'TEXT');
   addColumnIfMissing(db, 'integrations', 'connected_at', 'DATETIME');
-
-  // SQLite no permite agregar columnas con DEFAULT CURRENT_TIMESTAMP usando ALTER TABLE.
   addColumnIfMissing(db, 'integrations', 'created_at', 'DATETIME');
   addColumnIfMissing(db, 'integrations', 'updated_at', 'DATETIME');
 
@@ -672,7 +666,7 @@ function updateIntegration(db, idOrType, data = {}) {
 
 function getDefaultManualMessage(type) {
   if (type === 'whatsapp') {
-    return 'WhatsApp Business requiere configurar Meta App, token permanente, Phone Number ID y webhook.';
+    return 'WhatsApp Business requiere Meta App, token permanente, Phone Number ID y webhook.';
   }
 
   if (type === 'messenger') {
@@ -698,7 +692,6 @@ function getDefaultManualMessage(type) {
   return 'La integración está disponible para configurar manualmente.';
 }
 
-// GET /api/integrations
 router.get('/', authMiddleware, (req, res) => {
   try {
     const db = getDb();
@@ -721,7 +714,6 @@ router.get('/', authMiddleware, (req, res) => {
   }
 });
 
-// POST /api/integrations/bootstrap
 router.post('/bootstrap', authMiddleware, requireRole('admin', 'superadmin'), (req, res) => {
   try {
     const db = getDb();
@@ -746,7 +738,6 @@ router.post('/bootstrap', authMiddleware, requireRole('admin', 'superadmin'), (r
   }
 });
 
-// GET /api/integrations/:id
 router.get('/:id', authMiddleware, (req, res) => {
   try {
     const db = getDb();
@@ -758,6 +749,7 @@ router.get('/:id', authMiddleware, (req, res) => {
 
     if (!row) {
       return res.status(404).json({
+        success: false,
         error: 'Integración no encontrada.'
       });
     }
@@ -770,7 +762,6 @@ router.get('/:id', authMiddleware, (req, res) => {
   }
 });
 
-// PUT /api/integrations/:id
 router.put('/:id', authMiddleware, requireRole('admin', 'superadmin'), (req, res) => {
   try {
     const db = getDb();
@@ -782,6 +773,7 @@ router.put('/:id', authMiddleware, requireRole('admin', 'superadmin'), (req, res
 
     if (!existing) {
       return res.status(404).json({
+        success: false,
         error: 'Integración no encontrada.'
       });
     }
@@ -810,7 +802,6 @@ router.put('/:id', authMiddleware, requireRole('admin', 'superadmin'), (req, res
   }
 });
 
-// POST /api/integrations/:id/connect
 router.post('/:id/connect', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
   try {
     const db = getDb();
@@ -849,8 +840,6 @@ router.post('/:id/connect', authMiddleware, requireRole('admin', 'superadmin'), 
     } else if (type === 'openai' || type === 'openai_images') {
       result = await testOpenAI(config);
     } else {
-      // Para integraciones como WhatsApp, Messenger, Meta Ads y Google Ads,
-      // las dejamos listas para configuración manual, no conectadas automáticamente.
       shouldMarkConnected = !!req.body?.force_connected;
     }
 
@@ -875,7 +864,6 @@ router.post('/:id/connect', authMiddleware, requireRole('admin', 'superadmin'), 
   }
 });
 
-// POST /api/integrations/:id/test
 router.post('/:id/test', authMiddleware, requireRole('admin', 'superadmin'), async (req, res) => {
   try {
     const db = getDb();
@@ -937,7 +925,6 @@ router.post('/:id/test', authMiddleware, requireRole('admin', 'superadmin'), asy
   }
 });
 
-// POST /api/integrations/:id/disconnect
 router.post('/:id/disconnect', authMiddleware, requireRole('admin', 'superadmin'), (req, res) => {
   try {
     const db = getDb();
@@ -949,6 +936,7 @@ router.post('/:id/disconnect', authMiddleware, requireRole('admin', 'superadmin'
 
     if (!existing) {
       return res.status(404).json({
+        success: false,
         error: 'Integración no encontrada.'
       });
     }
