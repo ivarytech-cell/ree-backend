@@ -611,6 +611,7 @@ function ensureIntegrationsTable(db) {
 
 function findIntegration(db, idOrType) {
   const clean = String(idOrType || '').trim();
+  const lower = clean.toLowerCase();
   const canonical = normalizeType(clean);
 
   return db
@@ -618,11 +619,21 @@ function findIntegration(db, idOrType) {
       SELECT rowid, *
       FROM integrations
       WHERE CAST(id AS TEXT) = ?
-         OR type = ?
-         OR type = ?
+         OR LOWER(type) = LOWER(?)
+         OR LOWER(type) = LOWER(?)
+         OR LOWER(name) = LOWER(?)
+         OR LOWER(REPLACE(name, ' ', '_')) = LOWER(?)
+         OR LOWER(REPLACE(REPLACE(name, ' / ', '_'), ' ', '_')) = LOWER(?)
       LIMIT 1
     `)
-    .get(clean, clean, canonical);
+    .get(
+      clean,
+      clean,
+      canonical,
+      clean,
+      clean,
+      clean
+    );
 }
 
 function updateIntegration(db, idOrType, data = {}) {
