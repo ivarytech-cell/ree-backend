@@ -1,8 +1,7 @@
-// routes/agents.js
 const express = require('express');
+const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/database');
 const { authMiddleware } = require('../middleware/auth');
-const bcrypt = require('bcryptjs');
 const router = express.Router();
 
 router.get('/teams', authMiddleware, (req, res) => {
@@ -33,8 +32,8 @@ router.get('/:id', authMiddleware, (req, res) => {
   const agent = db.prepare('SELECT a.*, t.name as team_name FROM agents a LEFT JOIN teams t ON a.team_id=t.id WHERE a.id=?').get(req.params.id);
   if (!agent) return res.status(404).json({ error: 'Agente no encontrado' });
   const { password_hash, ...safe } = agent;
-  const convLoad = db.prepare("SELECT COUNT(*) as n FROM conversations WHERE assigned_agent_id=? AND status='open'").get(agent.id);
-  res.json({ ...safe, open_conversations: convLoad?.n || 0 });
+  const load = db.prepare("SELECT COUNT(*) as n FROM conversations WHERE assigned_agent_id=? AND status='open'").get(agent.id);
+  res.json({ ...safe, open_conversations: load?.n || 0 });
 });
 
 router.post('/', authMiddleware, (req, res) => {
@@ -43,7 +42,7 @@ router.post('/', authMiddleware, (req, res) => {
   if (!name || !username || !password) return res.status(400).json({ error: 'Nombre, usuario y contraseña requeridos' });
   try {
     const r = db.prepare('INSERT INTO agents (name, last_name, email, username, password_hash, role, team_id, avatar_color) VALUES (?,?,?,?,?,?,?,?)').run(name, last_name || '', email || '', username, bcrypt.hashSync(password, 10), role || 'vendedor', team_id || null, avatar_color || '#3b82f6');
-    res.json({ id: r.lastInsertRowid, name, username, role });
+    res.json({ id: r.lastInsertRowid, name, username });
   } catch (e) {
     if (e.message.includes('UNIQUE')) return res.status(400).json({ error: 'El usuario ya existe' });
     throw e;
