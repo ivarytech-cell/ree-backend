@@ -1,4 +1,3 @@
-// routes/stats.js
 const express = require('express');
 const { getDb } = require('../db/database');
 const { authMiddleware } = require('../middleware/auth');
