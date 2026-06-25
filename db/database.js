@@ -7,42 +7,159 @@ const DB_PATH = path.join(__dirname, '..', 'ree_app.db');
 let instance;
 
 class DB {
-  constructor(filePath) { this._db = new RawDB(filePath); }
-  exec(sql) { return this._db.exec(sql); }
+  constructor(filePath) {
+    this._db = new RawDB(filePath);
+
+    try {
+      this._db.exec('PRAGMA busy_timeout = 15000');
+    } catch (error) {}
+
+    try {
+      this._db.exec('PRAGMA foreign_keys = ON');
+    } catch (error) {}
+  }
+
+  _isLockedError(error) {
+    const message = String(error?.message || error || '').toLowerCase();
+
+    return (
+      message.includes('database is locked') ||
+      message.includes('sqlite_busy') ||
+      message.includes('database locked') ||
+      message.includes('busy')
+    );
+  }
+
+  _sleep(ms) {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    } catch (error) {
+      const start = Date.now();
+      while (Date.now() - start < ms) {}
+    }
+  }
+
+  _withRetry(fn, label = 'db') {
+    let lastError;
+
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      try {
+        return fn();
+      } catch (error) {
+        lastError = error;
+
+        if (!this._isLockedError(error)) {
+          throw error;
+        }
+
+        const wait = Math.min(250 * attempt, 2000);
+        console.warn(`[database] ${label} bloqueado. Reintentando ${attempt}/8 en ${wait}ms...`);
+        this._sleep(wait);
+      }
+    }
+
+    throw lastError;
+  }
+
+  _finalizeStatement(stmt) {
+    try {
+      if (stmt && typeof stmt.finalize === 'function') {
+        stmt.finalize();
+      } else if (stmt && typeof stmt.free === 'function') {
+        stmt.free();
+      }
+    } catch (error) {}
+  }
+
+  _toArr(args) {
+    if (args.length === 0) return [];
+    if (args.length === 1 && Array.isArray(args[0])) return args[0];
+    return args;
+  }
+
+  exec(sql) {
+    return this._withRetry(() => this._db.exec(sql), 'exec');
+  }
+
   prepare(sql) {
+    const self = this;
     const raw = this._db;
-    const toArr = (args) => {
-      if (args.length === 0) return [];
-      if (args.length === 1 && Array.isArray(args[0])) return args[0];
-      return args;
-    };
+
     return {
-      get: (...args) => raw.prepare(sql).get(toArr(args)),
-      all: (...args) => raw.prepare(sql).all(toArr(args)),
-      run: (...args) => raw.prepare(sql).run(toArr(args)),
+      get: (...args) => {
+        return self._withRetry(() => {
+          const stmt = raw.prepare(sql);
+
+          try {
+            return stmt.get(self._toArr(args));
+          } finally {
+            self._finalizeStatement(stmt);
+          }
+        }, 'prepare.get');
+      },
+
+      all: (...args) => {
+        return self._withRetry(() => {
+          const stmt = raw.prepare(sql);
+
+          try {
+            return stmt.all(self._toArr(args));
+          } finally {
+            self._finalizeStatement(stmt);
+          }
+        }, 'prepare.all');
+      },
+
+      run: (...args) => {
+        return self._withRetry(() => {
+          const stmt = raw.prepare(sql);
+
+          try {
+            return stmt.run(self._toArr(args));
+          } finally {
+            self._finalizeStatement(stmt);
+          }
+        }, 'prepare.run');
+      }
     };
   }
+
   get(sql, ...args) {
-    const p = args.length === 1 && Array.isArray(args[0]) ? args[0] : args;
-    return this._db.prepare(sql).get(p);
+    return this.prepare(sql).get(...args);
   }
+
   run(sql, ...args) {
-    const p = args.length === 1 && Array.isArray(args[0]) ? args[0] : args;
-    return this._db.prepare(sql).run(p);
+    return this.prepare(sql).run(...args);
   }
+
   all(sql, ...args) {
-    const p = args.length === 1 && Array.isArray(args[0]) ? args[0] : args;
-    return this._db.prepare(sql).all(p);
+    return this.prepare(sql).all(...args);
   }
 }
 
 function getDb() {
   if (!instance) {
     instance = new DB(DB_PATH);
-    instance.exec("PRAGMA journal_mode = WAL");
-    instance.exec("PRAGMA foreign_keys = ON");
+
+    try {
+      instance.exec('PRAGMA journal_mode = DELETE');
+    } catch (error) {}
+
+    try {
+      instance.exec('PRAGMA synchronous = NORMAL');
+    } catch (error) {}
+
+    try {
+      instance.exec('PRAGMA busy_timeout = 15000');
+    } catch (error) {}
+
+    try {
+      instance.exec('PRAGMA foreign_keys = ON');
+    } catch (error) {}
+
     initSchema();
   }
+
   return instance;
 }
 
