@@ -66,6 +66,7 @@ safeRoute('/api/agents', './routes/agents');
 safeRoute('/api/automations', './routes/automations');
 safeRoute('/api/integrations', './routes/integrations');
 safeRoute('/api/messaging', './routes/messaging');
+safeRoute('/api/whatsapp', './routes/whatsapp');
 safeRoute('/api/stats', './routes/stats');
 safeRoute('/api/commerce', './routes/commerce');
 
