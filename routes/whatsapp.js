@@ -128,7 +128,7 @@ async function sendImageMessage(to, imageUrl, caption = '') {
 }
 
 // GET /api/whatsapp/status
-router.get('/status', authMiddleware, (req, res) => {
+router.get('/status', (req, res) => {
   res.json({
     connected: hasWhatsappConfig(),
     graph_version: GRAPH_VERSION,
