@@ -19,8 +19,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2.0.1-v58-orders-technicians',
-    message: 'REE backend funcionando con técnicos y gobernanza',
+    version: '2.0.1-v59-tech-security',
+    message: 'REE backend funcionando con seguridad de técnicos',
   });
 });
 
@@ -30,11 +30,47 @@ app.get('/api/product-governance/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v58',
-    message: 'Ruta pública de diagnóstico activa con backend v58',
+    version: 'v59',
+    message: 'Ruta pública de diagnóstico activa con backend v59',
     timestamp: new Date().toISOString(),
   });
 });
+
+
+// Seguridad fuerte: un usuario técnico NO puede consumir APIs internas aunque escriba rutas manualmente.
+function technicianApiGuard(req, res, next) {
+  try {
+    if (!req.path.startsWith('/api/')) return next();
+
+    const publicExact = new Set(['/api/health', '/api/product-governance/ping']);
+    const allowedPrefixes = [
+      '/api/auth',
+      '/api/product-governance/technician',
+    ];
+
+    if (publicExact.has(req.path) || allowedPrefixes.some((prefix) => req.path.startsWith(prefix))) {
+      return next();
+    }
+
+    const authHeader = req.headers.authorization || req.headers.Authorization || '';
+    const token = String(authHeader).startsWith('Bearer ') ? String(authHeader).slice(7) : '';
+    if (!token) return next();
+
+    const jwt = require('jsonwebtoken');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const role = String(decoded?.role || '').toLowerCase();
+    if (['tecnico', 'técnico', 'technician'].includes(role)) {
+      return res.status(403).json({
+        error: 'Acceso limitado: los técnicos solo pueden usar el catálogo técnico y sus pedidos.',
+      });
+    }
+  } catch (error) {
+    // Si el token está vencido o inválido, dejamos que el middleware de cada ruta responda 401.
+  }
+  return next();
+}
+
+app.use(technicianApiGuard);
 
 // Inicializar base de datos sin tumbar el servidor completo
 try {
