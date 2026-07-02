@@ -1,4 +1,5 @@
 const express = require('express');
+const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/database');
 const { authMiddleware, requireRole } = require('../middleware/auth');
 
@@ -32,16 +33,41 @@ function ensureGovernanceSchema(db) {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS technician_profiles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      name TEXT NOT NULL,
+      phone TEXT,
+      email TEXT,
+      company TEXT,
+      assigned_vendor_id INTEGER,
+      assigned_vendor_name TEXT,
+      active INTEGER DEFAULT 1,
+      can_order INTEGER DEFAULT 1,
+      notes TEXT,
+      created_by INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS technician_orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       order_number TEXT UNIQUE,
       technician_user_id INTEGER,
+      technician_profile_id INTEGER,
       technician_name TEXT,
       technician_phone TEXT,
+      seller_user_id INTEGER,
+      seller_name TEXT,
       branch_pickup TEXT DEFAULT 'PRINCIPAL',
       status TEXT DEFAULT 'pending',
       subtotal REAL DEFAULT 0,
       notes TEXT,
+      status_notes TEXT,
+      confirmed_by INTEGER,
+      confirmed_at DATETIME,
+      delivered_at DATETIME,
+      canceled_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -78,6 +104,15 @@ function ensureGovernanceSchema(db) {
   addColumnIfMissing(db, 'products', 'governance_notes', 'TEXT');
   addColumnIfMissing(db, 'products', 'reviewed_by', 'INTEGER');
   addColumnIfMissing(db, 'products', 'reviewed_at', 'DATETIME');
+
+  addColumnIfMissing(db, 'technician_orders', 'technician_profile_id', 'INTEGER');
+  addColumnIfMissing(db, 'technician_orders', 'seller_user_id', 'INTEGER');
+  addColumnIfMissing(db, 'technician_orders', 'seller_name', 'TEXT');
+  addColumnIfMissing(db, 'technician_orders', 'status_notes', 'TEXT');
+  addColumnIfMissing(db, 'technician_orders', 'confirmed_by', 'INTEGER');
+  addColumnIfMissing(db, 'technician_orders', 'confirmed_at', 'DATETIME');
+  addColumnIfMissing(db, 'technician_orders', 'delivered_at', 'DATETIME');
+  addColumnIfMissing(db, 'technician_orders', 'canceled_at', 'DATETIME');
 }
 
 function toNumber(value, fallback = 0) {
@@ -90,19 +125,28 @@ function normalizeSku(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+function roleOf(user) {
+  return String(user?.role || '').toLowerCase();
+}
+
 function canManageGovernance(user) {
-  const role = String(user?.role || '').toLowerCase();
-  return ['superadmin', 'admin'].includes(role);
+  return ['superadmin', 'admin'].includes(roleOf(user));
 }
 
 function canReadProducts(user) {
-  const role = String(user?.role || '').toLowerCase();
-  return ['superadmin', 'admin', 'contabilidad', 'accounting', 'vendedor', 'marketing'].includes(role);
+  return ['superadmin', 'admin', 'contabilidad', 'accounting', 'vendedor', 'marketing'].includes(roleOf(user));
 }
 
 function isTechnician(user) {
-  const role = String(user?.role || '').toLowerCase();
-  return ['tecnico', 'técnico', 'technician'].includes(role);
+  return ['tecnico', 'técnico', 'technician'].includes(roleOf(user));
+}
+
+function canManageTechnicians(user) {
+  return ['superadmin', 'admin', 'vendedor'].includes(roleOf(user));
+}
+
+function canManageAllTechnicians(user) {
+  return ['superadmin', 'admin'].includes(roleOf(user));
 }
 
 function hasText(value) {
@@ -223,6 +267,62 @@ function getSkuCounts(products) {
   }, {});
 }
 
+function getUserById(db, id) {
+  if (!id) return null;
+  try {
+    return db.prepare('SELECT id, name, email, role, active FROM users WHERE id = ?').get(Number(id));
+  } catch (error) {
+    return null;
+  }
+}
+
+function getVendorName(db, id) {
+  const user = getUserById(db, id);
+  return user?.name || user?.email || '';
+}
+
+function getMyTechnicianProfile(db, user) {
+  if (!user?.id) return null;
+  try {
+    return db.prepare(`
+      SELECT tp.*, u.name AS user_name, u.email AS user_email, u.active AS user_active
+      FROM technician_profiles tp
+      LEFT JOIN users u ON u.id = tp.user_id
+      WHERE tp.user_id = ?
+      ORDER BY tp.id DESC
+      LIMIT 1
+    `).get(user.id) || null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function buildOrderWhereForUser(user) {
+  const role = roleOf(user);
+  if (['superadmin', 'admin'].includes(role)) return { where: '', params: [] };
+  if (role === 'vendedor') return { where: 'WHERE seller_user_id = ?', params: [user.id || 0] };
+  if (isTechnician(user)) return { where: 'WHERE technician_user_id = ?', params: [user.id || 0] };
+  return { where: 'WHERE 1=0', params: [] };
+}
+
+function getOrderWithItems(db, orderId) {
+  const order = db.prepare('SELECT * FROM technician_orders WHERE id = ?').get(orderId);
+  if (!order) return null;
+  order.items = db.prepare('SELECT * FROM technician_order_items WHERE order_id = ? ORDER BY id ASC').all(orderId);
+  return order;
+}
+
+// Ruta pública de diagnóstico para validar dominio/proxy sin token.
+router.get('/ping', (req, res) => {
+  res.json({
+    ok: true,
+    module: 'product-governance',
+    version: 'v53',
+    message: 'Ruta product-governance activa',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 router.use(authMiddleware);
 
 router.get('/quality', (req, res) => {
@@ -333,13 +433,225 @@ router.patch('/products/:id/governance', requireRole('superadmin', 'admin'), (re
         .run(req.user.id || null, 'update_product_governance', 'products', id, JSON.stringify(req.body));
     } catch (error) {}
 
-    const product = listProducts(db, { limit: 1, page: 1, search: '' }).find((item) => Number(item.id) === id) ||
-      db.prepare('SELECT * FROM products WHERE id = ?').get(id);
-
+    const product = db.prepare('SELECT * FROM products WHERE id = ?').get(id);
     return res.json({ success: true, product });
   } catch (error) {
     console.error('product-governance update error:', error);
     return res.status(500).json({ error: error.message || 'Error actualizando gobernanza' });
+  }
+});
+
+router.get('/technician/vendors', (req, res) => {
+  try {
+    const db = getDb();
+    ensureGovernanceSchema(db);
+    const role = roleOf(req.user);
+    let vendors;
+    if (role === 'vendedor') {
+      vendors = db.prepare(`SELECT id, name, email, role FROM users WHERE id = ? AND active = 1`).all(req.user.id || 0);
+    } else {
+      vendors = db.prepare(`
+        SELECT id, name, email, role
+        FROM users
+        WHERE active = 1 AND role IN ('vendedor','admin','superadmin')
+        ORDER BY CASE role WHEN 'vendedor' THEN 1 WHEN 'admin' THEN 2 ELSE 3 END, name ASC
+      `).all();
+    }
+    return res.json({ vendors });
+  } catch (error) {
+    console.error('technician vendors error:', error);
+    return res.status(500).json({ error: error.message || 'Error listando vendedores' });
+  }
+});
+
+router.get('/technician/me', (req, res) => {
+  try {
+    const db = getDb();
+    ensureGovernanceSchema(db);
+    const profile = getMyTechnicianProfile(db, req.user);
+    return res.json({ user: req.user, profile });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Error obteniendo perfil técnico' });
+  }
+});
+
+router.get('/technician/profiles', (req, res) => {
+  try {
+    const db = getDb();
+    ensureGovernanceSchema(db);
+    const role = roleOf(req.user);
+    let where = '';
+    const params = [];
+    if (role === 'vendedor') {
+      where = 'WHERE tp.assigned_vendor_id = ? OR tp.created_by = ?';
+      params.push(req.user.id || 0, req.user.id || 0);
+    } else if (isTechnician(req.user)) {
+      where = 'WHERE tp.user_id = ?';
+      params.push(req.user.id || 0);
+    } else if (!['superadmin', 'admin'].includes(role)) {
+      return res.status(403).json({ error: 'Sin permisos para ver técnicos' });
+    }
+
+    const profiles = db.prepare(`
+      SELECT tp.*, u.name AS user_name, u.email AS user_email, u.active AS user_active, v.name AS vendor_user_name, v.email AS vendor_email
+      FROM technician_profiles tp
+      LEFT JOIN users u ON u.id = tp.user_id
+      LEFT JOIN users v ON v.id = tp.assigned_vendor_id
+      ${where}
+      ORDER BY tp.created_at DESC, tp.id DESC
+      LIMIT 500
+    `).all(params);
+
+    return res.json({ profiles });
+  } catch (error) {
+    console.error('technician profiles list error:', error);
+    return res.status(500).json({ error: error.message || 'Error listando perfiles técnicos' });
+  }
+});
+
+router.post('/technician/profiles', (req, res) => {
+  try {
+    const db = getDb();
+    ensureGovernanceSchema(db);
+    if (!canManageTechnicians(req.user)) return res.status(403).json({ error: 'Sin permisos para crear técnicos' });
+
+    const name = String(req.body.name || '').trim();
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const phone = String(req.body.phone || '').trim();
+    const password = String(req.body.password || '').trim();
+    if (!name) return res.status(400).json({ error: 'El nombre del técnico es requerido' });
+    if (!email) return res.status(400).json({ error: 'El correo del técnico es requerido para que pueda iniciar sesión' });
+    if (!password || password.length < 8) return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+
+    let assignedVendorId = Number(req.body.assigned_vendor_id || 0) || null;
+    if (roleOf(req.user) === 'vendedor') assignedVendorId = req.user.id;
+    if (!assignedVendorId) return res.status(400).json({ error: 'Selecciona el vendedor responsable del técnico' });
+    const vendor = getUserById(db, assignedVendorId);
+    if (!vendor || !['vendedor', 'admin', 'superadmin'].includes(String(vendor.role || '').toLowerCase())) {
+      return res.status(400).json({ error: 'Vendedor responsable no válido' });
+    }
+
+    let user = db.prepare('SELECT id, email, name, role FROM users WHERE email = ?').get(email);
+    if (user && !isTechnician(user)) {
+      return res.status(400).json({ error: 'Ese correo ya pertenece a un usuario que no es técnico' });
+    }
+
+    if (!user) {
+      const result = db.prepare('INSERT INTO users(name,email,password,role,active) VALUES(?,?,?,?,?)')
+        .run(name, email, bcrypt.hashSync(password, 10), 'tecnico', Number(req.body.active ?? 1));
+      const userId = result?.lastInsertRowid || result?.lastID || db.prepare('SELECT last_insert_rowid() AS id').get().id;
+      user = { id: userId, email, name, role: 'tecnico' };
+    } else {
+      db.prepare('UPDATE users SET name = ?, password = ?, role = ?, active = ? WHERE id = ?')
+        .run(name, bcrypt.hashSync(password, 10), 'tecnico', Number(req.body.active ?? 1), user.id);
+    }
+
+    const existingProfile = db.prepare('SELECT id FROM technician_profiles WHERE user_id = ?').get(user.id);
+    const assignedVendorName = vendor.name || vendor.email || '';
+    let profileId;
+    if (existingProfile) {
+      db.prepare(`
+        UPDATE technician_profiles
+        SET name = ?, phone = ?, email = ?, company = ?, assigned_vendor_id = ?, assigned_vendor_name = ?, active = ?, can_order = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run([
+        name,
+        phone,
+        email,
+        req.body.company || '',
+        assignedVendorId,
+        assignedVendorName,
+        Number(req.body.active ?? 1),
+        Number(req.body.can_order ?? 1),
+        req.body.notes || '',
+        existingProfile.id,
+      ]);
+      profileId = existingProfile.id;
+    } else {
+      const result = db.prepare(`
+        INSERT INTO technician_profiles(user_id,name,phone,email,company,assigned_vendor_id,assigned_vendor_name,active,can_order,notes,created_by,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+      `).run([
+        user.id,
+        name,
+        phone,
+        email,
+        req.body.company || '',
+        assignedVendorId,
+        assignedVendorName,
+        Number(req.body.active ?? 1),
+        Number(req.body.can_order ?? 1),
+        req.body.notes || '',
+        req.user.id || null,
+      ]);
+      profileId = result?.lastInsertRowid || result?.lastID || db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    }
+
+    const profile = db.prepare('SELECT * FROM technician_profiles WHERE id = ?').get(profileId);
+    return res.status(201).json({ success: true, profile, user: { id: user.id, name, email, role: 'tecnico' } });
+  } catch (error) {
+    console.error('technician profile create error:', error);
+    return res.status(500).json({ error: error.message || 'Error creando perfil técnico' });
+  }
+});
+
+router.patch('/technician/profiles/:id', (req, res) => {
+  try {
+    const db = getDb();
+    ensureGovernanceSchema(db);
+    if (!canManageTechnicians(req.user)) return res.status(403).json({ error: 'Sin permisos para actualizar técnicos' });
+
+    const id = Number(req.params.id);
+    const profile = db.prepare('SELECT * FROM technician_profiles WHERE id = ?').get(id);
+    if (!profile) return res.status(404).json({ error: 'Perfil técnico no encontrado' });
+    if (roleOf(req.user) === 'vendedor' && Number(profile.assigned_vendor_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: 'Solo puedes editar técnicos asignados a tu usuario' });
+    }
+
+    let assignedVendorId = Number(req.body.assigned_vendor_id || profile.assigned_vendor_id || 0) || null;
+    if (roleOf(req.user) === 'vendedor') assignedVendorId = req.user.id;
+    const vendor = getUserById(db, assignedVendorId);
+    const assignedVendorName = vendor?.name || vendor?.email || profile.assigned_vendor_name || '';
+
+    const name = req.body.name ?? profile.name;
+    const phone = req.body.phone ?? profile.phone;
+    const email = req.body.email ?? profile.email;
+    const active = Number(req.body.active ?? profile.active);
+    const canOrder = Number(req.body.can_order ?? profile.can_order);
+
+    db.prepare(`
+      UPDATE technician_profiles
+      SET name = ?, phone = ?, email = ?, company = ?, assigned_vendor_id = ?, assigned_vendor_name = ?, active = ?, can_order = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run([
+      name,
+      phone,
+      email,
+      req.body.company ?? profile.company,
+      assignedVendorId,
+      assignedVendorName,
+      active,
+      canOrder,
+      req.body.notes ?? profile.notes,
+      id,
+    ]);
+
+    if (profile.user_id) {
+      const updates = ['name = ?', 'email = ?', 'active = ?'];
+      const values = [name, email, active];
+      if (req.body.password && String(req.body.password).length >= 8) {
+        updates.push('password = ?');
+        values.push(bcrypt.hashSync(String(req.body.password), 10));
+      }
+      values.push(profile.user_id);
+      db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(values);
+    }
+
+    const updated = db.prepare('SELECT * FROM technician_profiles WHERE id = ?').get(id);
+    return res.json({ success: true, profile: updated });
+  } catch (error) {
+    console.error('technician profile update error:', error);
+    return res.status(500).json({ error: error.message || 'Error actualizando perfil técnico' });
   }
 });
 
@@ -348,9 +660,16 @@ router.get('/technician/catalog', (req, res) => {
     const db = getDb();
     ensureGovernanceSchema(db);
 
-    const role = String(req.user?.role || '').toLowerCase();
+    const role = roleOf(req.user);
     const canSeeCatalog = ['superadmin', 'admin', 'vendedor', 'tecnico', 'técnico', 'technician'].includes(role);
     if (!canSeeCatalog) return res.status(403).json({ error: 'Sin permisos para catálogo técnico' });
+
+    if (isTechnician(req.user)) {
+      const profile = getMyTechnicianProfile(db, req.user);
+      if (!profile || Number(profile.active) !== 1) {
+        return res.status(403).json({ error: 'Perfil técnico no activo. Contacta a tu vendedor o administrador.' });
+      }
+    }
 
     const products = db.prepare(`
       SELECT
@@ -391,16 +710,40 @@ router.post('/technician/orders', (req, res) => {
     const db = getDb();
     ensureGovernanceSchema(db);
 
-    const role = String(req.user?.role || '').toLowerCase();
+    const role = roleOf(req.user);
     const canCreate = ['superadmin', 'admin', 'vendedor', 'tecnico', 'técnico', 'technician'].includes(role);
     if (!canCreate) return res.status(403).json({ error: 'Sin permisos para crear pedido técnico' });
 
     const items = Array.isArray(req.body.items) ? req.body.items : [];
     if (items.length === 0) return res.status(400).json({ error: 'El pedido debe tener productos' });
 
+    let profile = null;
+    let technicianProfileId = Number(req.body.technician_profile_id || 0) || null;
+    if (technicianProfileId) {
+      profile = db.prepare('SELECT * FROM technician_profiles WHERE id = ?').get(technicianProfileId);
+    }
+    if (isTechnician(req.user)) {
+      profile = getMyTechnicianProfile(db, req.user);
+      if (!profile || Number(profile.active) !== 1 || Number(profile.can_order) !== 1) {
+        return res.status(403).json({ error: 'Tu perfil técnico no está activo para pedidos' });
+      }
+      technicianProfileId = profile.id;
+    }
+
+    let sellerUserId = Number(req.body.seller_user_id || 0) || null;
+    if (role === 'vendedor') sellerUserId = req.user.id;
+    if (!sellerUserId && profile?.assigned_vendor_id) sellerUserId = Number(profile.assigned_vendor_id);
+    if (!sellerUserId) return res.status(400).json({ error: 'Selecciona el vendedor responsable del pedido' });
+
+    const seller = getUserById(db, sellerUserId);
+    if (!seller || !['vendedor', 'admin', 'superadmin'].includes(String(seller.role || '').toLowerCase())) {
+      return res.status(400).json({ error: 'Vendedor responsable no válido' });
+    }
+
     const orderNumber = `TEC-${Date.now()}`;
     const branch = req.body.branch_pickup || 'PRINCIPAL';
-    const technicianName = req.body.technician_name || req.user.name || req.user.email || 'Técnico';
+    const technicianName = profile?.name || req.body.technician_name || req.user.name || req.user.email || 'Técnico';
+    const technicianPhone = profile?.phone || req.body.technician_phone || '';
     let subtotal = 0;
 
     const normalizedItems = items.map((item) => {
@@ -433,20 +776,26 @@ router.post('/technician/orders', (req, res) => {
       INSERT INTO technician_orders(
         order_number,
         technician_user_id,
+        technician_profile_id,
         technician_name,
         technician_phone,
+        seller_user_id,
+        seller_name,
         branch_pickup,
         status,
         subtotal,
         notes,
         created_at,
         updated_at
-      ) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
     `).run([
       orderNumber,
       req.user.id || null,
+      technicianProfileId,
       technicianName,
-      req.body.technician_phone || '',
+      technicianPhone,
+      sellerUserId,
+      seller.name || seller.email || '',
       branch,
       'pending',
       subtotal,
@@ -462,7 +811,7 @@ router.post('/technician/orders', (req, res) => {
       `).run([orderId, item.product_id, item.product_name, item.sku, item.quantity, item.technician_price, item.subtotal]);
     });
 
-    return res.status(201).json({ success: true, order_id: orderId, order_number: orderNumber, subtotal });
+    return res.status(201).json({ success: true, order_id: orderId, order_number: orderNumber, subtotal, seller_user_id: sellerUserId });
   } catch (error) {
     console.error('technician order error:', error);
     return res.status(500).json({ error: error.message || 'Error creando pedido técnico' });
@@ -474,16 +823,7 @@ router.get('/technician/orders', (req, res) => {
     const db = getDb();
     ensureGovernanceSchema(db);
 
-    const role = String(req.user?.role || '').toLowerCase();
-    const isAdmin = ['superadmin', 'admin', 'vendedor'].includes(role);
-    const params = [];
-    let where = '';
-
-    if (!isAdmin) {
-      where = 'WHERE technician_user_id = ?';
-      params.push(req.user.id || 0);
-    }
-
+    const { where, params } = buildOrderWhereForUser(req.user);
     const orders = db.prepare(`
       SELECT *
       FROM technician_orders
@@ -492,10 +832,56 @@ router.get('/technician/orders', (req, res) => {
       LIMIT 200
     `).all(params);
 
-    return res.json({ orders });
+    const withItems = orders.map((order) => ({
+      ...order,
+      items: db.prepare('SELECT * FROM technician_order_items WHERE order_id = ? ORDER BY id ASC').all(order.id),
+    }));
+
+    return res.json({ orders: withItems });
   } catch (error) {
     console.error('technician orders list error:', error);
     return res.status(500).json({ error: error.message || 'Error listando pedidos técnicos' });
+  }
+});
+
+router.patch('/technician/orders/:id/status', (req, res) => {
+  try {
+    const db = getDb();
+    ensureGovernanceSchema(db);
+
+    const role = roleOf(req.user);
+    if (!['superadmin', 'admin', 'vendedor'].includes(role)) {
+      return res.status(403).json({ error: 'Sin permisos para actualizar pedidos técnicos' });
+    }
+
+    const id = Number(req.params.id);
+    const order = db.prepare('SELECT * FROM technician_orders WHERE id = ?').get(id);
+    if (!order) return res.status(404).json({ error: 'Pedido técnico no encontrado' });
+    if (role === 'vendedor' && Number(order.seller_user_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: 'Solo puedes actualizar pedidos asignados a tu vendedor' });
+    }
+
+    const status = String(req.body.status || '').trim().toLowerCase();
+    const allowed = ['pending', 'confirmed', 'paid', 'ready', 'delivered', 'cancelled', 'canceled'];
+    if (!allowed.includes(status)) return res.status(400).json({ error: 'Estado no válido' });
+    const normalizedStatus = status === 'canceled' ? 'cancelled' : status;
+
+    const updates = ['status = ?', 'status_notes = ?', 'updated_at = CURRENT_TIMESTAMP'];
+    const values = [normalizedStatus, req.body.status_notes || ''];
+    if (['confirmed', 'paid', 'ready'].includes(normalizedStatus)) {
+      updates.push('confirmed_by = ?', 'confirmed_at = COALESCE(confirmed_at, CURRENT_TIMESTAMP)');
+      values.push(req.user.id || null);
+    }
+    if (normalizedStatus === 'delivered') updates.push('delivered_at = CURRENT_TIMESTAMP');
+    if (normalizedStatus === 'cancelled') updates.push('canceled_at = CURRENT_TIMESTAMP');
+    values.push(id);
+
+    db.prepare(`UPDATE technician_orders SET ${updates.join(', ')} WHERE id = ?`).run(values);
+    const updated = getOrderWithItems(db, id);
+    return res.json({ success: true, order: updated });
+  } catch (error) {
+    console.error('technician order status error:', error);
+    return res.status(500).json({ error: error.message || 'Error actualizando pedido técnico' });
   }
 });
 
