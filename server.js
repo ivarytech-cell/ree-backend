@@ -19,8 +19,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2.0.1-v61-crm-marketing-ux-ai',
-    message: 'REE backend funcionando con CRM UX y Marketing IA conectado',
+    version: '2.0.1-v62-ai-assistant-control',
+    message: 'REE backend funcionando con Asistente IA, widget, CRM y marketing',
   });
 });
 
@@ -30,8 +30,8 @@ app.get('/api/product-governance/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v61',
-    message: 'Ruta pública de diagnóstico activa con backend v61',
+    version: 'v62',
+    message: 'Ruta pública de diagnóstico activa con backend v62',
     timestamp: new Date().toISOString(),
   });
 });
@@ -46,6 +46,9 @@ function technicianApiGuard(req, res, next) {
     const allowedPrefixes = [
       '/api/auth',
       '/api/product-governance/technician',
+      '/api/ai-assistant/public',
+      '/api/ai-assistant/ping',
+      '/api/ai-assistant/technician',
     ];
 
     if (publicExact.has(req.path) || allowedPrefixes.some((prefix) => req.path.startsWith(prefix))) {
@@ -96,6 +99,7 @@ safeRoute('/api/users', './routes/users');
 safeRoute('/api/products', './routes/products');
 safeRoute('/api/product-governance', './routes/product-governance');
 safeRoute('/api/crm-marketing', './routes/crm-marketing');
+safeRoute('/api/ai-assistant', './routes/ai-assistant-control');
 safeRoute('/api/categories', './routes/categories');
 safeRoute('/api/brands', './routes/brands');
 safeRoute('/api/settings', './routes/settings');
