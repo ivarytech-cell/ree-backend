@@ -317,8 +317,8 @@ router.get('/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v54',
-    message: 'Ruta product-governance activa',
+    version: 'v58',
+    message: 'Ruta product-governance activa con técnicos, órdenes y gobernanza',
     timestamp: new Date().toISOString(),
   });
 });
@@ -818,6 +818,42 @@ router.post('/technician/orders', (req, res) => {
   }
 });
 
+
+router.get('/technician/orders/summary', (req, res) => {
+  try {
+    const db = getDb();
+    ensureGovernanceSchema(db);
+    const { where, params } = buildOrderWhereForUser(req.user);
+    const rows = db.prepare(`
+      SELECT status, COUNT(*) AS count
+      FROM technician_orders
+      ${where}
+      GROUP BY status
+    `).all(params);
+    const summary = {
+      total: 0,
+      pending: 0,
+      confirmed: 0,
+      paid: 0,
+      ready: 0,
+      delivered: 0,
+      cancelled: 0,
+      needs_attention: 0,
+    };
+    rows.forEach((row) => {
+      const key = String(row.status || 'pending').toLowerCase() === 'canceled' ? 'cancelled' : String(row.status || 'pending').toLowerCase();
+      const count = Number(row.count || 0);
+      summary.total += count;
+      if (Object.prototype.hasOwnProperty.call(summary, key)) summary[key] += count;
+    });
+    summary.needs_attention = summary.pending + summary.confirmed + summary.paid + summary.ready;
+    return res.json({ summary });
+  } catch (error) {
+    console.error('technician orders summary error:', error);
+    return res.status(500).json({ error: error.message || 'Error obteniendo resumen de pedidos técnicos' });
+  }
+});
+
 router.get('/technician/orders', (req, res) => {
   try {
     const db = getDb();
@@ -834,6 +870,8 @@ router.get('/technician/orders', (req, res) => {
 
     const withItems = orders.map((order) => ({
       ...order,
+      type: 'technician',
+      channel: 'catalogo_tecnico',
       items: db.prepare('SELECT * FROM technician_order_items WHERE order_id = ? ORDER BY id ASC').all(order.id),
     }));
 
