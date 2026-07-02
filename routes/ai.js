@@ -1,804 +1,204 @@
+
 const express = require('express');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
 const Anthropic = require('@anthropic-ai/sdk');
-const pdfParse = require('pdf-parse');
 const { getDb } = require('../db/database');
 const { authMiddleware } = require('../middleware/auth');
-const { uploadDatasheet } = require('../middleware/upload');
 
 const router = express.Router();
-
-const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
-const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1';
-
 const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.BACKEND_URL || 'https://ree-backend-production.up.railway.app');
 
-function ensureSettingsTable(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    );
-  `);
-}
+function safeJson(value, fallback = {}) { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } }
+function tableExists(db, name) { try { return !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name); } catch { return false; } }
+function getColumns(db, table) { try { return db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name); } catch { return []; } }
+function getSetting(db, key, fallback = '') { try { const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key); return row?.value || fallback || ''; } catch { return fallback || ''; } }
+function productImageUrl(filename) { if (!filename) return null; const value = String(filename); if (value.startsWith('http://') || value.startsWith('https://')) return value; return `${BACKEND_URL}/uploads/images/${value}`; }
 
-function getSetting(key, fallback = '') {
+function getClaudeKey() {
   try {
     const db = getDb();
-    ensureSettingsTable(db);
-
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
-    return row?.value || fallback || '';
-  } catch (error) {
-    return fallback || '';
-  }
+    const direct = getSetting(db, 'anthropic_key', '') || getSetting(db, 'claude_key', '');
+    if (String(direct).startsWith('sk-ant-')) return String(direct);
+    const aiSettings = safeJson(getSetting(db, 'ai_assistant_settings', '{}'), {});
+    const maybe = aiSettings?.integrations?.anthropic_key || aiSettings?.claude_key || '';
+    if (String(maybe).startsWith('sk-ant-')) return String(maybe);
+  } catch (e) {}
+  return process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
 }
+function getModel() { try { const db = getDb(); return getSetting(db, 'claude_model', '') || getSetting(db, 'ai_model', '') || process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001'; } catch { return process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001'; } }
+function cleanReply(text) { return String(text || '').replace(/\*\*/g, '').replace(/^#{1,6}\s*/gm, '').replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim(); }
+function roleFromReq(req) { return String(req.user?.role || req.auth?.role || '').toLowerCase(); }
+function isTechReq(req) { return ['tecnico','técnico','technician'].includes(roleFromReq(req)); }
 
-function saveSetting(key, value) {
+function getProductCatalog(context = 'internal') {
   try {
     const db = getDb();
-    ensureSettingsTable(db);
-
-    db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value || '');
-  } catch (error) {}
-}
-
-function normalizeApiKey(value, type = 'claude') {
-  const text = String(value || '').trim();
-
-  if (type === 'openai') {
-    const match = text.match(/sk-[A-Za-z0-9_\-]+/);
-    return match ? match[0] : text;
-  }
-
-  const match = text.match(/sk-ant-[A-Za-z0-9_\-]+/);
-  return match ? match[0] : text;
-}
-
-function getAnthropicKey() {
-  const key =
-    getSetting('anthropic_key', '') ||
-    getSetting('claude_key', '') ||
-    process.env.ANTHROPIC_API_KEY ||
-    '';
-
-  return normalizeApiKey(key, 'claude');
-}
-
-function getOpenAIKey() {
-  const key =
-    getSetting('openai_key', '') ||
-    getSetting('image_ai_api_key', '') ||
-    getSetting('openai_images_key', '') ||
-    process.env.OPENAI_API_KEY ||
-    '';
-
-  return normalizeApiKey(key, 'openai');
-}
-
-function hasClaude() {
-  const key = getAnthropicKey();
-  return !!key && key.startsWith('sk-ant-');
-}
-
-function hasOpenAI() {
-  const key = getOpenAIKey();
-  return !!key && key.startsWith('sk-');
-}
-
-function getClaudeClient() {
-  const apiKey = getAnthropicKey();
-
-  if (!apiKey || !apiKey.startsWith('sk-ant-')) {
-    throw new Error('Claude AI no está conectado. Ve a Integraciones y conecta Claude AI con una API Key válida.');
-  }
-
-  return new Anthropic({ apiKey });
-}
-
-function extractJson(text) {
-  const match = String(text || '').match(/\{[\s\S]*\}/);
-
-  if (!match) {
-    throw new Error('La IA no devolvió JSON válido.');
-  }
-
-  return JSON.parse(match[0]);
-}
-
-function stripHtml(value) {
-  return String(value || '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function makeFallbackProduct({ product_name = '', brand = '', category = '', text = '' }) {
-  const cleanText = stripHtml(text).slice(0, 900);
-  const guessedName = product_name || cleanText.split('\n')[0] || 'Producto sin nombre';
-
-  return {
-    name: guessedName,
-    short_description: cleanText
-      ? cleanText.slice(0, 180)
-      : 'Producto técnico disponible para completar con información del datasheet.',
-    description: cleanText
-      ? `<p>${cleanText.slice(0, 1200)}</p>`
-      : '<p>Producto pendiente de completar con información técnica.</p>',
-    model: '',
-    brand: brand || '',
-    category: category || '',
-    attributes: [],
-    seo_keyword: guessedName,
-    seo_title: guessedName.slice(0, 60),
-    seo_description: cleanText
-      ? cleanText.slice(0, 155)
-      : 'Producto técnico para catálogo online.',
-    ai_warning: 'No se pudo usar la IA, pero el sistema procesó el archivo y generó una base editable.'
-  };
-}
-
-function getUploadedFile(req) {
-  if (req.file) return req.file;
-
-  if (Array.isArray(req.files) && req.files.length > 0) {
-    return req.files[0];
-  }
-
-  if (req.files && typeof req.files === 'object') {
-    const keys = Object.keys(req.files);
-    for (const key of keys) {
-      if (Array.isArray(req.files[key]) && req.files[key][0]) {
-        return req.files[key][0];
-      }
-    }
-  }
-
-  return null;
-}
-
-async function readUploadedFile(file) {
-  if (!file) {
-    throw new Error('No se recibió archivo.');
-  }
-
-  const buffer = fs.readFileSync(file.path);
-  const ext = path.extname(file.originalname || file.filename || '').toLowerCase();
-  const mimetype = String(file.mimetype || '').toLowerCase();
-
-  if (ext === '.pdf' || mimetype.includes('pdf')) {
-    const data = await pdfParse(buffer);
-
-    return {
-      text: String(data.text || '').substring(0, 12000),
-      pages: data.numpages || 0,
-      info: data.info || {},
-      file_type: 'pdf'
-    };
-  }
-
-  if (ext === '.txt' || mimetype.includes('text')) {
-    return {
-      text: buffer.toString('utf8').substring(0, 12000),
-      pages: 0,
-      info: {},
-      file_type: 'text'
-    };
-  }
-
-  return {
-    text: '',
-    pages: 0,
-    info: {},
-    file_type: ext.replace('.', '') || 'file',
-    warning: 'El archivo fue recibido, pero este formato no permite extraer texto directamente.'
-  };
-}
-
-function deleteUploadedFile(file) {
-  try {
-    if (file?.path && fs.existsSync(file.path)) {
-      fs.unlinkSync(file.path);
-    }
-  } catch (error) {}
-}
-
-function ensureGeneratedFolder() {
-  const folder = path.join(__dirname, '..', 'uploads', 'generated');
-
-  if (!fs.existsSync(folder)) {
-    fs.mkdirSync(folder, { recursive: true });
-  }
-
-  return folder;
-}
-
-function saveBase64Image(base64, prefix = 'ai-image') {
-  const folder = ensureGeneratedFolder();
-  const filename = `${prefix}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.png`;
-  const filepath = path.join(folder, filename);
-
-  fs.writeFileSync(filepath, Buffer.from(base64, 'base64'));
-
-  return {
-    filename,
-    filepath,
-    url: `${BACKEND_URL}/uploads/generated/${filename}`
-  };
-}
-
-function normalizeImageSize(size) {
-  const map = {
-    square: '1024x1024',
-    post: '1024x1024',
-    '1:1': '1024x1024',
-    '1080x1080': '1024x1024',
-
-    vertical: '1024x1536',
-    '4:5': '1024x1536',
-    story: '1024x1536',
-    reel: '1024x1536',
-    flyer: '1024x1536',
-
-    horizontal: '1536x1024',
-    banner: '1536x1024',
-    web: '1536x1024'
-  };
-
-  const clean = String(size || '').trim().toLowerCase();
-
-  if (['1024x1024', '1024x1536', '1536x1024', 'auto'].includes(clean)) {
-    return clean;
-  }
-
-  return map[clean] || '1024x1024';
-}
-
-function normalizeQuality(quality) {
-  const clean = String(quality || '').trim().toLowerCase();
-  return ['low', 'medium', 'high', 'auto'].includes(clean) ? clean : 'medium';
-}
-
-function getCommerceContext() {
-  try {
-    const db = getDb();
-
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS commerce_info (
-        key TEXT PRIMARY KEY,
-        value TEXT,
-        updated_at DATETIME
-      );
-    `);
-
-    const rows = db.prepare('SELECT key, value FROM commerce_info').all();
-    const info = {};
-
-    rows.forEach((row) => {
-      info[row.key] = row.value;
+    if (!tableExists(db, 'products')) return [];
+    const cols = getColumns(db, 'products');
+    const hasImages = tableExists(db, 'product_images');
+    const brandJoin = tableExists(db, 'brands') && cols.includes('brand_id') ? 'LEFT JOIN brands b ON p.brand_id = b.id' : '';
+    const catJoin = tableExists(db, 'categories') && cols.includes('category_id') ? 'LEFT JOIN categories c ON p.category_id = c.id' : '';
+    const brandExpr = brandJoin ? 'b.name' : (cols.includes('brand_name') ? 'p.brand_name' : 'NULL');
+    const catExpr = catJoin ? 'c.name' : (cols.includes('category_name') ? 'p.category_name' : 'NULL');
+    const imageExpr = hasImages ? '(SELECT filename FROM product_images WHERE product_id = p.id AND is_main = 1 LIMIT 1)' : (cols.includes('main_image') ? 'p.main_image' : (cols.includes('image') ? 'p.image' : 'NULL'));
+    const where = [];
+    if (cols.includes('status')) where.push("COALESCE(p.status,'') NOT IN ('deleted','archived')");
+    if (context === 'technician' && cols.includes('is_visible_to_technicians')) where.push('COALESCE(p.is_visible_to_technicians,0)=1');
+    const statusFilter = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const techPrice = cols.includes('technician_price') ? 'p.technician_price' : '0';
+    const sql = `
+      SELECT p.id,
+             ${cols.includes('name') ? 'p.name' : "'Producto sin nombre'"} AS name,
+             ${cols.includes('sku') ? 'p.sku' : 'NULL'} AS sku,
+             ${cols.includes('model') ? 'p.model' : 'NULL'} AS model,
+             ${cols.includes('price') ? 'p.price' : '0'} AS price,
+             ${cols.includes('sale_price') ? 'p.sale_price' : '0'} AS sale_price,
+             ${cols.includes('regular_price') ? 'p.regular_price' : '0'} AS regular_price,
+             ${techPrice} AS technician_price,
+             ${cols.includes('stock_status') ? 'p.stock_status' : "'instock'"} AS stock_status,
+             ${cols.includes('stock_quantity') ? 'p.stock_quantity' : '0'} AS stock_quantity,
+             ${cols.includes('commercial_status') ? 'p.commercial_status' : "'available'"} AS commercial_status,
+             ${brandExpr} AS brand,
+             ${catExpr} AS category,
+             ${imageExpr} AS main_image,
+             ${cols.includes('short_description') ? 'p.short_description' : 'NULL'} AS short_description,
+             ${cols.includes('description') ? 'p.description' : 'NULL'} AS description
+      FROM products p
+      ${brandJoin}
+      ${catJoin}
+      ${statusFilter}
+      ORDER BY COALESCE(p.stock_quantity,0) DESC, p.id DESC
+      LIMIT 700
+    `;
+    return db.prepare(sql).all().map((p) => {
+      const normal = Number(p.sale_price || p.price || p.regular_price || 0);
+      const tech = Number(p.technician_price || normal || 0);
+      const price = context === 'technician' ? tech : normal;
+      return {
+        id: p.id,
+        name: p.name || 'Producto sin nombre',
+        sku: p.sku || '',
+        model: p.model || '',
+        price,
+        regular_price: Number(p.price || p.regular_price || 0),
+        sale_price: Number(p.sale_price || 0),
+        technician_price: tech,
+        stock_status: p.stock_status || 'instock',
+        stock_quantity: Number(p.stock_quantity || 0),
+        commercial_status: p.commercial_status || 'available',
+        brand: p.brand || '',
+        category: p.category || '',
+        main_image: p.main_image || null,
+        image: productImageUrl(p.main_image),
+        description: p.short_description || p.description || ''
+      };
     });
-
-    return info;
-  } catch (error) {
-    return {};
+  } catch (e) {
+    console.error('[ai] product catalog error:', e.message);
+    return [];
   }
 }
 
-async function improvePromptWithClaude(rawPrompt, context = '') {
-  if (!hasClaude()) {
-    return rawPrompt;
-  }
-
-  const client = getClaudeClient();
-  const commerce = getCommerceContext();
-
-  const prompt = `
-Eres un director creativo experto en marketing visual para productos eléctricos, industriales, seguridad electrónica y energía solar.
-
-Mejora este prompt para una IA generadora de imágenes.
-
-Negocio: ${commerce.business_name || 'REElectrosistemas'}
-Estilo visual de marca: ${commerce.brand_visual_style || 'moderno, técnico y profesional'}
-Colores de marca: ${commerce.brand_primary_color || ''} ${commerce.brand_secondary_color || ''} ${commerce.brand_accent_color || ''}
-Tipografía sugerida: ${commerce.brand_heading_font || ''} ${commerce.brand_body_font || ''}
-Tono: ${commerce.brand_tone || 'profesional, claro y comercial'}
-Slogan: ${commerce.brand_slogan || ''}
-Instagram: ${commerce.instagram || ''}
-Teléfono/WhatsApp: ${commerce.whatsapp || commerce.phone || ''}
-Contexto: ${context || 'imagen comercial de producto'}
-
-Prompt original:
-${rawPrompt}
-
-Devuelve solo el prompt final, sin explicación. Debe especificar composición, fondo, iluminación, estilo, jerarquía visual, texto legible si aplica, y que la imagen se vea profesional, realista y comercial.
-`;
-
-  const message = await client.messages.create({
-    model: getSetting('ai_model', CLAUDE_MODEL) || CLAUDE_MODEL,
-    max_tokens: 900,
-    messages: [{ role: 'user', content: prompt }]
-  });
-
-  return message.content?.[0]?.text?.trim() || rawPrompt;
+function scoreProduct(product, text) {
+  const haystack = `${product.name} ${product.sku} ${product.model} ${product.brand} ${product.category} ${product.description}`.toLowerCase();
+  const words = String(text || '').toLowerCase().split(/[^a-záéíóúñ0-9]+/i).filter((w) => w.length >= 3);
+  let score = 0;
+  words.forEach((w) => { if (haystack.includes(w)) score += 1; });
+  if (product.stock_status === 'instock') score += 0.5;
+  return score;
+}
+function findRelatedProducts(text, catalog = []) {
+  const idMatches = [...String(text || '').matchAll(/\[ID:(\d+)\]/g)].map((m) => Number(m[1]));
+  const matchedById = catalog.filter((p) => idMatches.includes(Number(p.id)));
+  const scored = catalog.map((p) => ({ ...p, score: scoreProduct(p, text) })).filter((p) => p.score > 0).sort((a, b) => b.score - a.score).slice(0, 6);
+  const unique = [];
+  const seen = new Set();
+  [...matchedById, ...scored].forEach((p) => { if (!seen.has(p.id)) { seen.add(p.id); unique.push(p); } });
+  return unique.slice(0, 6).map((p) => ({
+    id: p.id, name: p.name, model: p.model, sku: p.sku, price: p.price,
+    sale_price: p.sale_price, technician_price: p.technician_price,
+    stock_status: p.stock_status, stock_quantity: p.stock_quantity,
+    main_image: p.main_image || null, image: p.image || null
+  }));
+}
+function catalogText(catalog, context) {
+  return catalog.slice(0, 220).map((p) => {
+    const priceLabel = context === 'technician' ? 'Precio técnico' : 'Precio venta';
+    const price = p.price ? `RD$ ${Number(p.price).toLocaleString('es-DO')}` : 'Consultar precio';
+    return `[ID:${p.id}] ${p.name}${p.sku ? ` | SKU: ${p.sku}` : ''}${p.model ? ` | Modelo: ${p.model}` : ''}${p.brand ? ` | Marca: ${p.brand}` : ''}${p.category ? ` | Categoría: ${p.category}` : ''} | ${priceLabel}: ${price} | Stock: ${p.stock_status === 'instock' ? `Disponible (${p.stock_quantity})` : 'Agotado'}`;
+  }).join('\n');
+}
+function localReply(message, catalog, context) {
+  const related = findRelatedProducts(message, catalog);
+  if (!related.length) return context === 'technician'
+    ? 'Puedo ayudarte con productos autorizados para técnicos. Dime si buscas cámaras, inversores, alarmas, paneles solares o algún modelo específico.'
+    : 'Puedo ayudarte a elegir el producto correcto. Dime si buscas cámaras, inversores, paneles solares, alarmas, control de acceso o algún modelo específico.';
+  const lines = related.map((p, i) => `${i + 1}. ${p.name}${p.sku ? ` (${p.sku})` : ''}\nPrecio: ${p.price ? `RD$ ${Number(p.price).toLocaleString('es-DO')}` : 'Consultar'}\nStock: ${p.stock_status === 'instock' ? `Disponible (${p.stock_quantity || 0})` : 'Agotado'}`).join('\n\n');
+  return `Encontré estas opciones:\n\n${lines}\n\nSi te interesa una, dime cuál y te ayudo con el siguiente paso.`;
 }
 
-async function generateImageWithOpenAI(prompt, options = {}) {
-  const apiKey = getOpenAIKey();
-
-  if (!apiKey || !apiKey.startsWith('sk-')) {
-    throw new Error('OpenAI no está conectado. Ve a Integraciones y conecta ChatGPT / OpenAI u OpenAI Imágenes.');
+async function answerWithAi({ message, history = [], context = 'internal' }) {
+  const catalog = getProductCatalog(context);
+  const apiKey = getClaudeKey();
+  if (!apiKey) {
+    const reply = localReply(message, catalog, context);
+    return { reply, answer: reply, products: findRelatedProducts(message + ' ' + reply, catalog), related_products: findRelatedProducts(message + ' ' + reply, catalog), provider: 'local', product_count: catalog.length };
   }
+  const systemPrompt = `Eres Rubén IA, asistente comercial y técnico de REElectrosistemas en República Dominicana.
 
-  const body = {
-    model: options.model || getSetting('image_ai_model', OPENAI_IMAGE_MODEL) || OPENAI_IMAGE_MODEL,
-    prompt,
-    n: 1,
-    size: normalizeImageSize(options.size || getSetting('image_ai_size', '1024x1024')),
-    quality: normalizeQuality(options.quality || getSetting('image_ai_quality', 'medium'))
-  };
+Habla natural, claro y vendedor.
 
-  const response = await axios.post('https://api.openai.com/v1/images/generations', body, {
-    timeout: 120000,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    }
-  });
+No uses negritas con asteriscos.
 
-  const item = response.data?.data?.[0];
+No uses markdown pesado.
 
-  if (!item) {
-    throw new Error('OpenAI no devolvió imagen.');
+Responde con espacios entre ideas para que parezca una conversación natural.
+
+Nunca reveles costo interno, margen, proveedor ni información privada.
+
+${context === 'technician' ? 'El usuario es técnico. Usa solo precios técnicos y productos autorizados para técnicos. Ayuda a crear pedidos técnicos.' : 'Usa precios normales de venta en RD$.'}
+
+Cuando menciones productos del catálogo, incluye su [ID:X] para que la app pueda mostrar la foto.
+
+Si el usuario muestra interés en comprar, dile que puedes conectarlo con un asesor.
+
+Catálogo disponible:
+${catalogText(catalog, context)}`;
+  try {
+    const client = new Anthropic({ apiKey });
+    const messages = Array.isArray(history)
+      ? history.slice(-10).filter((m) => m && m.content).map((m) => ({ role: m.role === 'assistant' || m.role === 'ai' ? 'assistant' : 'user', content: String(m.content) }))
+      : [];
+    messages.push({ role: 'user', content: String(message) });
+    const response = await client.messages.create({ model: getModel(), max_tokens: 900, system: systemPrompt, messages });
+    const reply = cleanReply(response.content?.[0]?.text || 'Puedo ayudarte con ese producto.');
+    const products = findRelatedProducts(message + ' ' + reply, catalog);
+    return { reply, answer: reply, products, related_products: products, provider: 'claude', product_count: catalog.length };
+  } catch (err) {
+    console.error('[ai] Claude error:', err.response?.data || err.message);
+    const reply = localReply(message, catalog, context);
+    const products = findRelatedProducts(message + ' ' + reply, catalog);
+    return { reply, answer: reply, products, related_products: products, provider: 'local_fallback', product_count: catalog.length, warning: 'Claude falló, se usó respuesta local.' };
   }
-
-  if (item.b64_json) {
-    return saveBase64Image(item.b64_json, 'openai-image');
-  }
-
-  if (item.url) {
-    return {
-      url: item.url,
-      filename: null,
-      filepath: null
-    };
-  }
-
-  throw new Error('OpenAI no devolvió una imagen válida.');
 }
 
-async function generateProductWithClaude({ text = '', product_name = '', category = '', brand = '' }) {
-  if (!hasClaude()) {
-    return makeFallbackProduct({ product_name, brand, category, text });
-  }
-
-  const client = getClaudeClient();
-
-  const prompt = `
-Eres un experto en productos eléctricos, industriales, cámaras, seguridad, energía solar, redes y automatización.
-
-Genera información completa para este producto en español.
-
-Producto/Modelo:
-${product_name || 'No especificado'}
-
-Marca:
-${brand || 'No especificada'}
-
-Categoría:
-${category || 'No especificada'}
-
-Información del datasheet o texto:
-${String(text || '').substring(0, 6000)}
-
-Responde ÚNICAMENTE con JSON válido:
-{
-  "name": "nombre completo del producto",
-  "short_description": "descripción corta comercial de 1-2 oraciones",
-  "description": "descripción detallada en HTML con beneficios, usos y características",
-  "model": "modelo/referencia",
-  "brand": "marca detectada o vacía",
-  "category": "categoría detectada o vacía",
-  "attributes": [
-    { "name": "atributo", "value": "valor" }
-  ],
-  "seo_keyword": "palabra clave principal",
-  "seo_title": "título SEO máximo 60 caracteres",
-  "seo_description": "meta descripción máximo 155 caracteres"
-}
-`;
-
-  const message = await client.messages.create({
-    model: getSetting('ai_model', CLAUDE_MODEL) || CLAUDE_MODEL,
-    max_tokens: 1800,
-    messages: [{ role: 'user', content: prompt }]
-  });
-
-  const responseText = message.content?.[0]?.text?.trim() || '';
-  return extractJson(responseText);
-}
-
-// GET /api/ai/status
 router.get('/status', authMiddleware, (req, res) => {
-  res.json({
-    claude_connected: hasClaude(),
-    openai_connected: hasOpenAI(),
-    claude_model: getSetting('ai_model', CLAUDE_MODEL) || CLAUDE_MODEL,
-    image_model: getSetting('image_ai_model', OPENAI_IMAGE_MODEL) || OPENAI_IMAGE_MODEL
-  });
+  const context = isTechReq(req) ? 'technician' : 'internal';
+  const catalog = getProductCatalog(context);
+  res.json({ ready: !!getClaudeKey(), product_count: catalog.length, version: '2.0-v69-unified-ai', model: getModel(), provider: getClaudeKey() ? 'claude' : 'local', context });
+});
+router.post('/chat', authMiddleware, async (req, res, next) => {
+  try { const { message, history = [], context } = req.body || {}; if (!message) return res.status(400).json({ error: 'Mensaje requerido' }); const ctx = context || (isTechReq(req) ? 'technician' : 'internal'); res.json(await answerWithAi({ message, history, context: ctx })); } catch (e) { next(e); }
+});
+router.post('/internal/message', authMiddleware, async (req, res, next) => {
+  try { const { message, history = [] } = req.body || {}; if (!message) return res.status(400).json({ error: 'Mensaje requerido' }); res.json(await answerWithAi({ message, history, context: 'internal' })); } catch (e) { next(e); }
+});
+router.post('/technician/message', authMiddleware, async (req, res, next) => {
+  try { const { message, history = [] } = req.body || {}; if (!message) return res.status(400).json({ error: 'Mensaje requerido' }); res.json(await answerWithAi({ message, history, context: 'technician' })); } catch (e) { next(e); }
 });
 
-// POST /api/ai/parse-datasheet
-router.post('/parse-datasheet', authMiddleware, uploadDatasheet.any(), async (req, res) => {
-  const file = getUploadedFile(req);
-
-  if (!file) {
-    return res.status(400).json({
-      error: 'No se recibió archivo.'
-    });
-  }
-
-  try {
-    const parsed = await readUploadedFile(file);
-    deleteUploadedFile(file);
-
-    res.json({
-      success: true,
-      ...parsed
-    });
-  } catch (error) {
-    deleteUploadedFile(file);
-    console.error('[ai] parse-datasheet error:', error);
-
-    res.status(500).json({
-      success: false,
-      error: 'Error leyendo el archivo: ' + error.message
-    });
-  }
-});
-
-// POST /api/ai/process-datasheet
-router.post('/process-datasheet', authMiddleware, uploadDatasheet.any(), async (req, res) => {
-  const file = getUploadedFile(req);
-
-  if (!file) {
-    return res.status(400).json({
-      success: false,
-      error: 'No se recibió archivo.'
-    });
-  }
-
-  try {
-    const parsed = await readUploadedFile(file);
-    deleteUploadedFile(file);
-
-    let product;
-
-    try {
-      product = await generateProductWithClaude({
-        text: parsed.text,
-        product_name: req.body?.product_name || req.body?.name || '',
-        category: req.body?.category || '',
-        brand: req.body?.brand || ''
-      });
-    } catch (aiError) {
-      product = makeFallbackProduct({
-        product_name: req.body?.product_name || req.body?.name || '',
-        category: req.body?.category || '',
-        brand: req.body?.brand || '',
-        text: parsed.text
-      });
-
-      product.ai_warning = aiError.message;
-    }
-
-    res.json({
-      success: true,
-      text: parsed.text,
-      pages: parsed.pages,
-      info: parsed.info,
-      product,
-      ...product
-    });
-  } catch (error) {
-    deleteUploadedFile(file);
-    console.error('[ai] process-datasheet error:', error);
-
-    res.status(500).json({
-      success: false,
-      error: 'Error procesando el archivo: ' + error.message
-    });
-  }
-});
-
-// Alias para frontends viejos
-router.post('/analyze-datasheet', authMiddleware, uploadDatasheet.any(), async (req, res) => {
-  const file = getUploadedFile(req);
-
-  if (!file) {
-    return res.status(400).json({
-      success: false,
-      error: 'No se recibió archivo.'
-    });
-  }
-
-  try {
-    const parsed = await readUploadedFile(file);
-    deleteUploadedFile(file);
-
-    let product;
-
-    try {
-      product = await generateProductWithClaude({
-        text: parsed.text,
-        product_name: req.body?.product_name || req.body?.name || '',
-        category: req.body?.category || '',
-        brand: req.body?.brand || ''
-      });
-    } catch (aiError) {
-      product = makeFallbackProduct({
-        product_name: req.body?.product_name || req.body?.name || '',
-        category: req.body?.category || '',
-        brand: req.body?.brand || '',
-        text: parsed.text
-      });
-
-      product.ai_warning = aiError.message;
-    }
-
-    res.json({
-      success: true,
-      text: parsed.text,
-      pages: parsed.pages,
-      info: parsed.info,
-      product,
-      ...product
-    });
-  } catch (error) {
-    deleteUploadedFile(file);
-    console.error('[ai] analyze-datasheet error:', error);
-
-    res.status(500).json({
-      success: false,
-      error: 'Error procesando el archivo: ' + error.message
-    });
-  }
-});
-
-// POST /api/ai/generate-product
-router.post('/generate-product', authMiddleware, async (req, res) => {
-  const { text, product_name, name, category, brand } = req.body || {};
-
-  if (!text && !product_name && !name) {
-    return res.status(400).json({
-      error: 'Se requiere texto o nombre del producto.'
-    });
-  }
-
-  try {
-    const product = await generateProductWithClaude({
-      text: text || '',
-      product_name: product_name || name || '',
-      category: category || '',
-      brand: brand || ''
-    });
-
-    res.json(product);
-  } catch (error) {
-    console.error('[ai] generate-product error:', error);
-
-    res.json(makeFallbackProduct({
-      product_name: product_name || name || '',
-      category: category || '',
-      brand: brand || '',
-      text: text || ''
-    }));
-  }
-});
-
-// POST /api/ai/generate-specs
-router.post('/generate-specs', authMiddleware, async (req, res) => {
-  const { product_name, category, brand, model, text } = req.body || {};
-
-  if (!product_name && !text) {
-    return res.status(400).json({
-      error: 'Se requiere nombre o texto del producto.'
-    });
-  }
-
-  if (!hasClaude()) {
-    return res.json({
-      specs: [],
-      datasheet_summary: 'Claude AI no está conectado. Completa la integración para generar especificaciones automáticamente.',
-      ai_warning: 'Claude AI no conectado.'
-    });
-  }
-
-  try {
-    const client = getClaudeClient();
-
-    const prompt = `
-Eres un experto técnico en productos eléctricos e industriales.
-
-Genera especificaciones técnicas para:
-Producto: ${product_name || ''}
-Modelo: ${model || ''}
-Marca: ${brand || ''}
-Categoría: ${category || ''}
-Información adicional:
-${String(text || '').substring(0, 3500)}
-
-Responde ÚNICAMENTE con JSON válido:
-{
-  "specs": [
-    { "name": "Voltaje de entrada", "value": "110/220V AC" }
-  ],
-  "datasheet_summary": "Resumen técnico en 2-3 oraciones"
-}
-Incluye 8 a 12 especificaciones técnicas con unidades cuando aplique.
-`;
-
-    const message = await client.messages.create({
-      model: getSetting('ai_model', CLAUDE_MODEL) || CLAUDE_MODEL,
-      max_tokens: 1000,
-      messages: [{ role: 'user', content: prompt }]
-    });
-
-    res.json(extractJson(message.content?.[0]?.text || ''));
-  } catch (error) {
-    console.error('[ai] generate-specs error:', error);
-
-    res.status(500).json({
-      error: 'Error generando especificaciones: ' + error.message
-    });
-  }
-});
-
-// POST /api/ai/seo
-router.post('/seo', authMiddleware, async (req, res) => {
-  const { name, description, category, brand } = req.body || {};
-
-  if (!name) {
-    return res.status(400).json({
-      error: 'Nombre requerido.'
-    });
-  }
-
-  if (!hasClaude()) {
-    return res.json({
-      seo_keyword: name,
-      seo_title: String(name).slice(0, 60),
-      seo_description: stripHtml(description || name).slice(0, 155),
-      ai_warning: 'Claude AI no conectado.'
-    });
-  }
-
-  try {
-    const client = getClaudeClient();
-
-    const prompt = `
-Genera SEO optimizado en español para este producto:
-Nombre: ${name}
-Marca: ${brand || ''}
-Categoría: ${category || ''}
-Descripción: ${String(description || '').substring(0, 900)}
-
-Responde SOLO con JSON:
-{
-  "seo_keyword": "...",
-  "seo_title": "...",
-  "seo_description": "..."
-}
-`;
-
-    const message = await client.messages.create({
-      model: getSetting('ai_model', CLAUDE_MODEL) || CLAUDE_MODEL,
-      max_tokens: 600,
-      messages: [{ role: 'user', content: prompt }]
-    });
-
-    res.json(extractJson(message.content?.[0]?.text || ''));
-  } catch (error) {
-    res.status(500).json({
-      error: 'Error generando SEO: ' + error.message
-    });
-  }
-});
-
-// POST /api/ai/improve-prompt
-router.post('/improve-prompt', authMiddleware, async (req, res) => {
-  const { prompt, context } = req.body || {};
-
-  if (!prompt) {
-    return res.status(400).json({
-      error: 'Prompt requerido.'
-    });
-  }
-
-  try {
-    const improvedPrompt = await improvePromptWithClaude(prompt, context || 'product_image');
-
-    res.json({
-      success: true,
-      prompt: improvedPrompt,
-      improved_prompt: improvedPrompt
-    });
-  } catch (error) {
-    res.json({
-      success: true,
-      prompt,
-      improved_prompt: prompt,
-      warning: error.message
-    });
-  }
-});
-
-// POST /api/ai/generate-image
-router.post('/generate-image', authMiddleware, async (req, res) => {
-  try {
-    const {
-      prompt,
-      provider = 'openai',
-      size,
-      quality,
-      model
-    } = req.body || {};
-
-    if (!prompt) {
-      return res.status(400).json({
-        success: false,
-        error: 'Prompt requerido.'
-      });
-    }
-
-    let finalPrompt = prompt;
-
-    if (provider === 'claude' || provider === 'claude_ai' || provider === 'claude_design') {
-      finalPrompt = await improvePromptWithClaude(prompt, 'product_image_generation');
-    }
-
-    const image = await generateImageWithOpenAI(finalPrompt, {
-      size,
-      quality,
-      model
-    });
-
-    res.json({
-      success: true,
-      url: image.url,
-      image_url: image.url,
-      filename: image.filename,
-      prompt_used: finalPrompt
-    });
-  } catch (error) {
-    console.error('[ai] generate-image error:', error.response?.data || error.message);
-
-    res.status(400).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
-// POST /api/ai/search-youtube
-router.post('/search-youtube', authMiddleware, async (req, res) => {
-  const { query, product_name, model, brand } = req.body || {};
-  const searchText = query || [brand, product_name, model, 'review instalación'].filter(Boolean).join(' ');
-
-  if (!searchText) {
-    return res.status(400).json({
-      error: 'Query requerido.'
-    });
-  }
-
-  res.json({
-    search_url: `https://www.youtube.com/results?search_query=${encodeURIComponent(searchText)}`,
-    query: searchText
-  });
-});
+// Rutas de configuración, widget, conocimiento y leads. Siguen funcionando, pero ahora cuelgan del módulo unificado.
+router.use('/', require('./ai-assistant-control'));
 
 module.exports = router;
