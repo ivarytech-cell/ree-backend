@@ -19,8 +19,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2.0.1-v67-ai-assistant-ux',
-    message: 'REE backend funcionando con Asistente IA, widget, CRM y marketing',
+    version: '2.0.1-v68-ai-claude-products',
+    message: 'REE backend funcionando con IA, Claude, productos y widget actualizado',
   });
 });
 
@@ -30,7 +30,7 @@ app.get('/api/product-governance/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v67',
+    version: 'v68',
     message: 'Ruta pública de diagnóstico activa con backend v62',
     timestamp: new Date().toISOString(),
   });
