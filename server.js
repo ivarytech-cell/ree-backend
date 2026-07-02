@@ -19,8 +19,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2.0.1-v60-crm-marketing',
-    message: 'REE backend funcionando con CRM, etiquetas y Marketing Meta',
+    version: '2.0.1-v61-crm-marketing-ux-ai',
+    message: 'REE backend funcionando con CRM UX y Marketing IA conectado',
   });
 });
 
@@ -30,8 +30,8 @@ app.get('/api/product-governance/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v60',
-    message: 'Ruta pública de diagnóstico activa con backend v60',
+    version: 'v61',
+    message: 'Ruta pública de diagnóstico activa con backend v61',
     timestamp: new Date().toISOString(),
   });
 });
