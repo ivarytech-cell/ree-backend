@@ -19,19 +19,19 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2.0.1-v54-technicians',
+    version: '2.0.1-v58-orders-technicians',
     message: 'REE backend funcionando con técnicos y gobernanza',
   });
 });
 
 
-// Diagnóstico público para confirmar que el deploy v54 está activo sin token
+// Diagnóstico público para confirmar que el deploy v58 está activo sin token
 app.get('/api/product-governance/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v54',
-    message: 'Ruta pública de diagnóstico activa antes del middleware de autenticación',
+    version: 'v58',
+    message: 'Ruta pública de diagnóstico activa con backend v58',
     timestamp: new Date().toISOString(),
   });
 });
