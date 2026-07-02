@@ -317,8 +317,8 @@ router.get('/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v58',
-    message: 'Ruta product-governance activa con técnicos, órdenes y gobernanza',
+    version: 'v59',
+    message: 'Ruta product-governance activa con seguridad técnica v59',
     timestamp: new Date().toISOString(),
   });
 });
@@ -330,8 +330,8 @@ router.get('/quality', (req, res) => {
     const db = getDb();
     ensureGovernanceSchema(db);
 
-    if (!canReadProducts(req.user) && !isTechnician(req.user)) {
-      return res.status(403).json({ error: 'Sin permisos para ver productos' });
+    if (!canReadProducts(req.user)) {
+      return res.status(403).json({ error: 'Sin permisos para ver productos internos' });
     }
 
     const products = listProducts(db, req.query);
