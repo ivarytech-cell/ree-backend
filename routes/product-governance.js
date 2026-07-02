@@ -317,7 +317,7 @@ router.get('/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v53',
+    version: 'v54',
     message: 'Ruta product-governance activa',
     timestamp: new Date().toISOString(),
   });
