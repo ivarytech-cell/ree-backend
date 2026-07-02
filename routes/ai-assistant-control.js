@@ -33,7 +33,7 @@ const DEFAULT_SETTINGS = {
     greeting: 'Hola, soy el asistente de REElectrosistemas. ¿Qué producto o solución estás buscando?',
     fallback: 'No tengo esa información confirmada ahora mismo, pero puedo conectarte con un asesor.',
     forbidden: 'No revelar costos internos, márgenes, proveedores, tokens, datos privados ni precios técnicos fuera del catálogo técnico.',
-    style: 'Responde breve, con seguridad, sin inventar datos y siempre orientado a la siguiente acción comercial.'
+    style: 'Responde breve, natural y conversacional. Usa espacios entre ideas. No uses markdown, asteriscos, títulos con numeral ni negritas. No inventes datos y orienta siempre a la siguiente acción comercial.'
   },
   business: {
     company_name: 'REElectrosistemas',
@@ -345,6 +345,8 @@ async function aiAnswer(payload) {
       context === 'technician' ? 'El usuario es técnico: solo muestra precio técnico y productos autorizados.' : '',
       context === 'public_web' || context === 'woocommerce' ? 'Usuario público: solo mostrar precio normal/de venta, nunca costo ni precio técnico.' : '',
       'No inventes stock, precio, garantía ni disponibilidad.',
+      'No uses markdown. No uses **negritas**, asteriscos, tablas ni encabezados con #.',
+      'Escribe con frases naturales y separa ideas con saltos de línea cuando ayude a leer mejor.',
       'Si recomiendas productos, invita a tocar “Me interesa”.'
     ].filter(Boolean).join('\n');
     const compactProducts = products.map(publicProduct);
@@ -431,7 +433,7 @@ function upsertClientFromLead(db, lead) {
 }
 
 router.get('/ping', (req, res) => {
-  res.json({ ok: true, module: 'ai-assistant-control', version: 'v62', timestamp: nowIso() });
+  res.json({ ok: true, module: 'ai-assistant-control', version: 'v67', timestamp: nowIso() });
 });
 
 router.get('/public/settings', (req, res) => {
