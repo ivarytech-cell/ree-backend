@@ -19,8 +19,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2.0.1-v59-tech-security',
-    message: 'REE backend funcionando con seguridad de técnicos',
+    version: '2.0.1-v60-crm-marketing',
+    message: 'REE backend funcionando con CRM, etiquetas y Marketing Meta',
   });
 });
 
@@ -30,8 +30,8 @@ app.get('/api/product-governance/ping', (req, res) => {
   res.json({
     ok: true,
     module: 'product-governance',
-    version: 'v59',
-    message: 'Ruta pública de diagnóstico activa con backend v59',
+    version: 'v60',
+    message: 'Ruta pública de diagnóstico activa con backend v60',
     timestamp: new Date().toISOString(),
   });
 });
@@ -95,6 +95,7 @@ safeRoute('/api/auth', './routes/auth');
 safeRoute('/api/users', './routes/users');
 safeRoute('/api/products', './routes/products');
 safeRoute('/api/product-governance', './routes/product-governance');
+safeRoute('/api/crm-marketing', './routes/crm-marketing');
 safeRoute('/api/categories', './routes/categories');
 safeRoute('/api/brands', './routes/brands');
 safeRoute('/api/settings', './routes/settings');
