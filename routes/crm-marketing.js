@@ -317,7 +317,149 @@ function buildCalendar({ days = 30, posts_per_day = 2, product_focus = '', niche
   return { calendar, hooks };
 }
 
-router.get('/ping', (req, res) => res.json({ ok: true, module: 'crm-marketing', version: 'v60', timestamp: new Date().toISOString() }));
+
+async function callOpenAIJson(systemPrompt, userPayload, fallback) {
+  const key = process.env.OPENAI_API_KEY || process.env.OPENAI_API_TOKEN;
+  if (!key) return fallback;
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: JSON.stringify(userPayload).slice(0, 60000) }
+        ],
+        temperature: 0.55,
+      }),
+    });
+    const data = await response.json();
+    const text = data?.choices?.[0]?.message?.content || '';
+    if (!response.ok) throw new Error(data?.error?.message || 'OpenAI error');
+    return JSON.parse(text);
+  } catch (error) {
+    console.warn('⚠️ Fallback IA local:', error.message);
+    return fallback;
+  }
+}
+function normalizeLinkList(value) {
+  if (Array.isArray(value)) return value.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 20);
+  return String(value || '').split(/\n|,/).map((x) => x.trim()).filter(Boolean).slice(0, 20);
+}
+async function fetchMetaMediaIfPossible(db, postLinks) {
+  const connection = currentConnection(db);
+  if (!connection || connection.status !== 'connected' || !connection.instagram_business_account_id) return { used_meta: false, media: [] };
+  let full = null;
+  try { full = db.prepare('SELECT * FROM meta_connections ORDER BY id DESC LIMIT 1').get(); } catch { full = null; }
+  const token = full?.access_token;
+  if (!token) return { used_meta: false, media: [] };
+  const graphVersion = process.env.META_GRAPH_VERSION || 'v20.0';
+  try {
+    const url = `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(connection.instagram_business_account_id)}/media?fields=id,caption,media_type,permalink,timestamp,like_count,comments_count&limit=50&access_token=${encodeURIComponent(token)}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data?.error?.message || 'Meta API error');
+    const links = new Set(postLinks.map((x) => String(x).replace(/\?.*$/, '').replace(/\/$/, '')));
+    let media = Array.isArray(data.data) ? data.data : [];
+    if (links.size) {
+      media = media.filter((m) => links.has(String(m.permalink || '').replace(/\?.*$/, '').replace(/\/$/, '')) || [...links].some((l) => String(m.permalink || '').includes(l.split('/').filter(Boolean).pop() || '___')));
+    }
+    return { used_meta: true, media };
+  } catch (error) {
+    return { used_meta: false, error: error.message, media: [] };
+  }
+}
+function fallbackInstagramAnalysis(payload, recommendations, metaData) {
+  const products = Array.isArray(payload.selected_products) && payload.selected_products.length ? payload.selected_products : recommendations.slice(0, 5).map((r) => r.product_name);
+  const links = normalizeLinkList(payload.post_links);
+  const base = payload.instagram || 'la cuenta conectada';
+  return {
+    success: true,
+    source: metaData?.used_meta ? 'meta_api_fallback_local' : 'links_fallback_local',
+    instagram: base,
+    executive_summary: `La cuenta debe enfocarse en contenido educativo con intención comercial: mostrar problemas reales, soluciones técnicas y productos concretos. Se analizaron ${links.length || metaData?.media?.length || 0} referencias disponibles.`,
+    working: [
+      'Contenido que resuelve dudas técnicas antes de comprar.',
+      'Comparaciones claras entre productos o capacidades.',
+      'Demostraciones de instalación, uso o resultado final.',
+      'Ofertas conectadas a una necesidad concreta, no solo precio.',
+    ],
+    not_working: [
+      'Publicaciones genéricas sin producto ni problema específico.',
+      'Demasiados textos sin una promesa clara en los primeros segundos.',
+      'Vender sin explicar por qué el producto le conviene al cliente.',
+    ],
+    double_down: `Duplicar reels/carruseles cortos sobre errores comunes, seguridad, energía y ahorro. Empujar primero: ${products.slice(0, 5).join(', ') || payload.product_focus || 'productos con stock y precio técnico claro'}.`,
+    recommended_products: products.slice(0, 10).map((name, index) => ({ name, reason: index === 0 ? 'producto prioritario por enfoque comercial' : 'producto útil para contenido educativo' })),
+    content_angles: ['Errores antes de comprar', 'Comparativas simples', 'Checklist de instalación', 'Caso real de negocio/hogar', 'Oferta con urgencia responsable'],
+    hooks: [
+      'No compres esto sin verlo',
+      'Tu seguridad falla por esto',
+      'Esto parece barato, sale caro',
+      'El error que nadie revisa',
+      'Antes de instalar, mira esto',
+      'Tu inversor puede fallar',
+      'Cámaras buenas no bastan',
+      'Esto protege tu negocio',
+      'Lo barato aquí engaña',
+      'Este detalle evita problemas',
+    ],
+    meta_used: !!metaData?.used_meta,
+    meta_media_count: metaData?.media?.length || 0,
+  };
+}
+function buildCalendarSmart({ days = 30, posts_per_day = 2, selected_products = [], product_focus = '', niche = '', audience = '', analysis = null }) {
+  const products = Array.isArray(selected_products) && selected_products.length ? selected_products : String(product_focus || '').split(/\n|,/).map((x) => x.trim()).filter(Boolean);
+  const fallbackProducts = products.length ? products : ['producto recomendado'];
+  const formats = ['Reel', 'Carrusel', 'Post educativo', 'Reel demostración', 'Carrusel comparativo'];
+  const angles = Array.isArray(analysis?.content_angles) && analysis.content_angles.length ? analysis.content_angles : [
+    'error común que cuesta dinero',
+    'comparación rápida antes de comprar',
+    'beneficio técnico explicado simple',
+    'caso de uso real para negocio/hogar',
+    'checklist antes de instalar',
+    'promoción con urgencia responsable'
+  ];
+  const calendar = [];
+  const d = Math.max(1, Math.min(toNum(days, 30), 90));
+  const ppd = Math.max(1, Math.min(toNum(posts_per_day, 2), 5));
+  for (let day = 1; day <= d; day += 1) {
+    for (let slot = 1; slot <= ppd; slot += 1) {
+      const product = fallbackProducts[(day + slot - 2) % fallbackProducts.length];
+      const format = formats[(day + slot) % formats.length];
+      const angle = angles[(day + slot * 2) % angles.length];
+      calendar.push({
+        day,
+        slot,
+        product,
+        product_focus: product,
+        format,
+        title: `${angle}: ${product}`,
+        objective: slot === 1 ? 'atraer y educar' : 'convertir consulta en cotización',
+        client_ideal: audience || 'cliente que busca seguridad, energía o instalación confiable',
+        CTA: 'Cotiza con REElectrosistemas',
+        copy_idea: `Explica ${angle} de forma simple. Presenta ${product} como solución y cierra con una pregunta para cotización.`,
+      });
+    }
+  }
+  const hooks = Array.isArray(analysis?.hooks) && analysis.hooks.length ? analysis.hooks.slice(0, 10) : [
+    'No compres esto sin verlo',
+    'Tu seguridad falla por esto',
+    'Esto parece barato, sale caro',
+    'El error que nadie revisa',
+    'Antes de instalar, mira esto',
+    'Tu inversor puede fallar',
+    'Cámaras buenas no bastan',
+    'Esto protege tu negocio',
+    'Lo barato aquí engaña',
+    'Este detalle evita problemas'
+  ];
+  return { calendar, hooks };
+}
+
+router.get('/ping', (req, res) => res.json({ ok: true, module: 'crm-marketing', version: 'v61', timestamp: new Date().toISOString() }));
 router.use(authMiddleware);
 
 router.get('/crm/labels', (req, res) => {
@@ -453,6 +595,26 @@ router.get('/crm/inbox/ownership', (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+
+router.get('/marketing/meta/setup-guide', (req, res) => {
+  try {
+    res.json({
+      version: 'v61',
+      architecture: 'oauth_multi_tenant',
+      steps: [
+        'Crear una app en Meta Developers para REEAPP.',
+        'Agregar Facebook Login for Business y configurar el redirect URI público del backend.',
+        'Solicitar permisos: pages_show_list, pages_read_engagement, instagram_basic, instagram_manage_insights y ads_read si se usarán anuncios.',
+        'Guardar META_APP_ID, META_APP_SECRET, META_REDIRECT_URI y opcional META_GRAPH_VERSION en Railway.',
+        'Cada cliente conecta su Facebook/Instagram desde REEAPP; no se crea un Railway por cliente.',
+        'Guardar tokens por empresa/tenant, con expiración, revocación y auditoría.',
+        'La IA debe leer datos mediante endpoints internos con permisos; no debe recibir tokens de Meta en el frontend.'
+      ],
+      mcp_note: 'MCP puede usarse después como capa interna para que la IA consulte productos, CRM, Meta y órdenes como herramientas. No reemplaza OAuth de Meta ni la gestión de permisos por cliente.'
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 router.get('/marketing/meta/status', (req, res) => {
   try {
     if (!canUseMarketing(req.user)) return res.status(403).json({ error: 'Sin permisos para Marketing' });
@@ -490,6 +652,34 @@ router.post('/marketing/meta/disconnect', (req, res) => {
     res.json({ success: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
+
+router.post('/marketing/analyze-instagram', async (req, res) => {
+  try {
+    if (!canUseMarketing(req.user)) return res.status(403).json({ error: 'Sin permisos para análisis Marketing' });
+    const db = getDb(); ensureSchema(db);
+    const products = buildLocalRecommendations(getProductsForRecommendations(db));
+    const postLinks = normalizeLinkList(req.body.post_links);
+    const metaData = await fetchMetaMediaIfPossible(db, postLinks);
+    const fallback = fallbackInstagramAnalysis(req.body || {}, products, metaData);
+    const systemPrompt = `Eres un estratega senior de marketing digital B2B/B2C para una empresa de seguridad electrónica, energía e instalaciones técnicas. Devuelve SOLO JSON válido con estas claves: executive_summary, working, not_working, double_down, recommended_products, content_angles, hooks. hooks debe tener 10 frases de menos de 10 palabras. No inventes métricas. Si hay links sin métricas, analiza patrones y aclara que es diagnóstico cualitativo.`;
+    const ai = await callOpenAIJson(systemPrompt, {
+      instagram: req.body.instagram || '',
+      niche: req.body.niche || '',
+      audience: req.body.audience || '',
+      goal: req.body.goal || 'ventas',
+      post_links: postLinks,
+      selected_products: req.body.selected_products || [],
+      local_product_recommendations: products.slice(0, 12),
+      meta_used: metaData.used_meta,
+      meta_media: metaData.media || []
+    }, fallback);
+    const result = { ...fallback, ...ai, success: true, source: metaData.used_meta ? 'meta_api_ai' : (process.env.OPENAI_API_KEY ? 'links_ai' : 'links_local'), meta_used: !!metaData.used_meta, meta_media_count: metaData.media?.length || 0 };
+    const info = db.prepare(`INSERT INTO marketing_analyses (niche, audience, product_focus, goal, posts_json, analysis_text, recommendations_json, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(req.body.niche || '', req.body.audience || '', (req.body.selected_products || []).join(', ') || req.body.product_focus || '', req.body.goal || 'ventas', JSON.stringify({ post_links: postLinks, meta_media: metaData.media || [] }), result.executive_summary || result.analysis_text || '', JSON.stringify(result), req.user.id || null);
+    res.json({ ...result, analysis_id: info.lastInsertRowid });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 router.post('/marketing/analyze', (req, res) => {
   try {
     if (!canUseMarketing(req.user)) return res.status(403).json({ error: 'Sin permisos para análisis Marketing' });
@@ -506,15 +696,32 @@ router.post('/marketing/analyze', (req, res) => {
     res.json({ success: true, analysis_id: info.lastInsertRowid, analysis_text: result.analysis, recommendations: result.recommendations, top_posts: result.top_posts });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
-router.post('/marketing/calendar', (req, res) => {
+router.post('/marketing/calendar', async (req, res) => {
   try {
     if (!canUseMarketing(req.user)) return res.status(403).json({ error: 'Sin permisos para calendario Marketing' });
     const db = getDb(); ensureSchema(db);
-    const result = buildCalendar(req.body || {});
-    const info = db.prepare(`INSERT INTO marketing_calendars (analysis_id, days, posts_per_day, product_focus, calendar_json, hooks_json, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(req.body.analysis_id || null, toNum(req.body.days, 30), toNum(req.body.posts_per_day, 2), req.body.product_focus || '', JSON.stringify(result.calendar), JSON.stringify(result.hooks), req.user.id || null);
-    res.json({ success: true, calendar_id: info.lastInsertRowid, calendar: result.calendar, hooks: result.hooks });
+    const fallback = buildCalendarSmart(req.body || {});
+    const systemPrompt = `Eres un planificador de contenido senior. Devuelve SOLO JSON válido con claves calendar y hooks. calendar debe ser un array con day, slot, format, product, title, objective, client_ideal, CTA, copy_idea. Crea contenido accionable para ventas, mezclando reels, carruseles y posts. hooks: 10 hooks menores de 10 palabras.`;
+    const ai = await callOpenAIJson(systemPrompt, {
+      days: Math.max(1, Math.min(toNum(req.body.days, 30), 90)),
+      posts_per_day: Math.max(1, Math.min(toNum(req.body.posts_per_day, 2), 5)),
+      selected_products: req.body.selected_products || [],
+      product_focus: req.body.product_focus || '',
+      niche: req.body.niche || '',
+      audience: req.body.audience || '',
+      goal: req.body.goal || 'ventas',
+      analysis: req.body.analysis || null
+    }, fallback);
+    const result = {
+      calendar: Array.isArray(ai.calendar) ? ai.calendar : fallback.calendar,
+      hooks: Array.isArray(ai.hooks) ? ai.hooks.slice(0, 10) : fallback.hooks
+    };
+    const info = db.prepare(`INSERT INTO marketing_calendars (analysis_id, days, posts_per_day, product_focus, calendar_json, hooks_json, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(req.body.analysis_id || null, toNum(req.body.days, 30), toNum(req.body.posts_per_day, 2), (req.body.selected_products || []).join(', ') || req.body.product_focus || '', JSON.stringify(result.calendar), JSON.stringify(result.hooks), req.user.id || null);
+    res.json({ success: true, calendar_id: info.lastInsertRowid, calendar: result.calendar, hooks: result.hooks, source: process.env.OPENAI_API_KEY ? 'ai' : 'local' });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
+
 router.get('/marketing/recommendations', (req, res) => {
   try {
     if (!canUseMarketing(req.user)) return res.status(403).json({ error: 'Sin permisos para recomendaciones' });
